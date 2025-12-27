@@ -75,11 +75,16 @@ PROXY_FILE: Final = Path(os.getenv("PROXY_FILE_PATH") or (BASE_DIR / "proxy.txt"
     ASK_ORDER_LINK,
     ASK_ORDER_RAW,
     ASK_CONFIRM,
-) = range(26)
+    ASK_TOKEN2_ID,
+) = range(27)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(Path(__file__).resolve().parent / "bot.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -265,6 +270,12 @@ class ChangePaymentClient:
             used_proxy = proxy
 
             try:
+                logger.info(
+                    "Отправка запроса changepayment: proxy=%s headers=%s body=%s",
+                    proxy,
+                    json.dumps(headers, ensure_ascii=False),
+                    json.dumps(payload, ensure_ascii=False),
+                )
                 async with self._session.post(
                     self.base_url,
                     json=payload,
@@ -273,9 +284,15 @@ class ChangePaymentClient:
                     timeout=timeout,
                 ) as resp:
                     text = await resp.text()
+                    logger.info(
+                        "Ответ changepayment: status=%s body=%s",
+                        resp.status,
+                        _trim_text(text, 2000),
+                    )
                     return True, resp.status, text, proxy
             except Exception as e:  # noqa: BLE001
                 last_exc = str(e)
+                logger.warning("Ошибка запроса changepayment: %s", last_exc)
 
         return False, None, last_exc, used_proxy
 
@@ -481,6 +498,8 @@ def init_db():
             card TEXT,
             orderid TEXT,
             trip_link TEXT,
+            tariff TEXT,
+            price TEXT,
             session_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -496,6 +515,34 @@ def init_db():
         cur.execute("ALTER TABLE trip_templates ADD COLUMN trip_name TEXT;")
     except sqlite3.OperationalError:
         pass  # уже есть
+
+    try:
+        cur.execute("ALTER TABLE trip_templates ADD COLUMN tariff TEXT;")
+    except sqlite3.OperationalError:
+        pass  # уже есть
+
+    try:
+        cur.execute("ALTER TABLE trip_templates ADD COLUMN price TEXT;")
+    except sqlite3.OperationalError:
+        pass  # уже есть
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS swap_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER NOT NULL,
+            token2 TEXT,
+            session_id TEXT,
+            trip_id TEXT,
+            card TEXT,
+            orderid TEXT,
+            trip_link TEXT,
+            tariff TEXT,
+            price TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
 
     cur.execute(
         """
@@ -636,7 +683,7 @@ def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, session_id
+        SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, tariff, price, session_id
         FROM trip_templates
         WHERE id = ? AND tg_id = ?
         LIMIT 1;
@@ -654,6 +701,8 @@ def get_trip_template(trip_id: int, tg_id: int) -> Optional[dict]:
             "card",
             "orderid",
             "trip_link",
+            "tariff",
+            "price",
             "session_id",
         ]
         return dict(zip(keys, row))
@@ -668,6 +717,8 @@ def update_trip_template_field(trip_id: int, tg_id: int, field: str, value: str)
         "card",
         "orderid",
         "trip_link",
+        "tariff",
+        "price",
         "session_id",
     }:
         return
@@ -728,7 +779,7 @@ def list_trip_templates(tg_id: int) -> List[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, session_id, created_at
+        SELECT id, trip_name, token2, trip_id, card, orderid, trip_link, tariff, price, session_id, created_at
         FROM trip_templates
         WHERE tg_id = ?
         ORDER BY id DESC;
@@ -745,6 +796,8 @@ def list_trip_templates(tg_id: int) -> List[dict]:
         "card",
         "orderid",
         "trip_link",
+        "tariff",
+        "price",
         "session_id",
         "created_at",
     ]
@@ -757,6 +810,160 @@ def delete_trip_template(trip_id: int, tg_id: int) -> None:
     cur.execute("DELETE FROM trip_templates WHERE id = ? AND tg_id = ?;", (trip_id, tg_id))
     conn.commit()
     conn.close()
+
+
+def log_swap_history(tg_id: int, details: dict) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO swap_history (
+            tg_id,
+            token2,
+            session_id,
+            trip_id,
+            card,
+            orderid,
+            trip_link,
+            tariff,
+            price
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            tg_id,
+            details.get("token2"),
+            details.get("session_id"),
+            details.get("trip_id"),
+            details.get("card"),
+            details.get("orderid"),
+            details.get("trip_link"),
+            details.get("tariff"),
+            details.get("price"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_swap_history_count(tg_id: int) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM swap_history WHERE tg_id = ?;", (tg_id,))
+    (count,) = cur.fetchone()
+    conn.close()
+    return count or 0
+
+
+def list_recent_swaps(tg_id: int, limit: int = 5) -> List[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, tariff, price, trip_link, token2, session_id, created_at
+        FROM swap_history
+        WHERE tg_id = ?
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (tg_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    keys = [
+        "id",
+        "tariff",
+        "price",
+        "trip_link",
+        "token2",
+        "session_id",
+        "created_at",
+    ]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def get_swap_by_id(tg_id: int, swap_id: int) -> Optional[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, created_at
+        FROM swap_history
+        WHERE tg_id = ? AND id = ?
+        LIMIT 1;
+        """,
+        (tg_id, swap_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    keys = [
+        "id",
+        "tariff",
+        "price",
+        "trip_link",
+        "token2",
+        "session_id",
+        "orderid",
+        "card",
+        "trip_id",
+        "created_at",
+    ]
+    return dict(zip(keys, row))
+
+
+def export_swaps_to_file(tg_id: int) -> Optional[str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, created_at
+        FROM swap_history
+        WHERE tg_id = ?
+        ORDER BY id DESC;
+        """,
+        (tg_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return None
+
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix=f"swaps_{tg_id}_")
+    os.close(fd)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"TG ID: {tg_id}\n")
+        f.write(f"Всего подмен: {len(rows)}\n")
+        f.write("=" * 50 + "\n\n")
+        for row in rows:
+            (
+                swap_id,
+                tariff,
+                price,
+                trip_link,
+                token2,
+                session_id,
+                orderid,
+                card,
+                trip_id,
+                created_at,
+            ) = row
+            f.write(f"Запись #{swap_id}\n")
+            f.write(f"Время: {created_at}\n")
+            f.write(f"Цена: {price or '—'}\n")
+            f.write(f"Тариф: {tariff or '—'}\n")
+            f.write(f"Ссылка: {trip_link or '—'}\n")
+            f.write(f"token2: {token2 or '—'}\n")
+            f.write(f"session_id: {session_id or '—'}\n")
+            f.write(f"orderid: {orderid or '—'}\n")
+            f.write(f"card-x: {card or '—'}\n")
+            f.write(f"ID: {trip_id or '—'}\n")
+            f.write("-" * 40 + "\n\n")
+
+    return path
 
 
 def fetch_mike_orders() -> List[dict]:
@@ -834,6 +1041,8 @@ def clear_trip_template(trip_id: int, tg_id: int) -> None:
             card = NULL,
             orderid = NULL,
             trip_link = NULL,
+            tariff = NULL,
+            price = NULL,
             session_id = NULL
         WHERE id = ? AND tg_id = ?;
         """,
@@ -922,11 +1131,17 @@ async def fetch_session_details(session_id: str) -> dict:
     cookies = {"Session_id": session_id}
     result: dict = {"session_id": session_id, "_debug_responses": []}
 
+    logger.info(
+        "Запрос launch по session_id: headers=%s cookies=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(cookies, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers, cookies=cookies
         ) as resp:
             launch_text = await resp.text()
+    logger.info("Ответ launch по session_id: %s", _trim_text(launch_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -947,6 +1162,11 @@ async def fetch_session_details(session_id: str) -> dict:
 
     payload = json.dumps({"id": result["trip_id"]}, ensure_ascii=False)
 
+    logger.info(
+        "Запрос paymentmethods по session_id: headers=%s body=%s",
+        json.dumps(payment_headers, ensure_ascii=False),
+        payload,
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/paymentmethods",
@@ -955,6 +1175,7 @@ async def fetch_session_details(session_id: str) -> dict:
             cookies=cookies,
         ) as resp:
             payment_text = await resp.text()
+    logger.info("Ответ paymentmethods по session_id: %s", _trim_text(payment_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -994,11 +1215,16 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
 
     result: dict = {"token2": token2, "_debug_responses": []}
 
+    logger.info(
+        "Запрос launch по token2: headers=%s",
+        json.dumps(headers, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers
         ) as resp:
             launch_text = await resp.text()
+    logger.info("Ответ launch по token2: %s", _trim_text(launch_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -1019,6 +1245,11 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
 
     payload = json.dumps({"id": result["trip_id"]}, ensure_ascii=False)
 
+    logger.info(
+        "Запрос paymentmethods по token2: headers=%s body=%s",
+        json.dumps(payment_headers, ensure_ascii=False),
+        payload,
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/paymentmethods",
@@ -1026,6 +1257,7 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
             headers=payment_headers,
         ) as resp:
             payment_text = await resp.text()
+    logger.info("Ответ paymentmethods по token2: %s", _trim_text(payment_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -1039,6 +1271,124 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
         result["card"] = card_match.group(1)
 
     return result
+
+
+async def fetch_pending_orders_orderid(token2: str) -> Tuple[Optional[str], str]:
+    headers = {
+        "Host": "tc.mobile.yandex.net",
+        "Authorization": f"Bearer {token2}",
+        "Accept": "*/*",
+        "X-Yataxi-Ongoing-Orders-Statuses": "taxi=transporting@1",
+        "X-VPN-Active": "1",
+        "Accept-Language": "ru;q=1, ru-PL;q=0.9, en-GB;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "X-YaTaxi-Has-Ongoing-Orders": "true",
+        "User-Agent": "ru.yandex.ytaxi/700.108.0.501438 (iPhone; iPhone13,2; iOS 18.5; Darwin)",
+        "Connection": "keep-alive",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        logger.info(
+            "Запрос pending-orders: headers=%s",
+            json.dumps(headers, ensure_ascii=False),
+        )
+        async with session.get(
+            "https://tc.mobile.yandex.net/4.0/pending-orders/v1/orders",
+            headers=headers,
+        ) as resp:
+            resp_text = await resp.text()
+    logger.info("Ответ pending-orders: %s", _trim_text(resp_text, 2000))
+
+    orderid = None
+    try:
+        payload = json.loads(resp_text)
+        active = payload.get("active_orders")
+        if isinstance(active, list) and active:
+            item = active[0]
+            if isinstance(item, dict):
+                orderid = item.get("order_id") or item.get("orderid")
+                if orderid is not None:
+                    orderid = str(orderid)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return orderid, resp_text
+
+
+async def fetch_taxiontheway_info(
+    token2: str, orderid: str, trip_id: str
+) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+    headers = {
+        "Host": "tc.mobile.yandex.net",
+        "User-Agent": "ru.yandex.ytaxi/700.108.0.501438 (iPhone; iPhone13,2; iOS 18.5; Darwin)",
+        "X-YaTaxi-Has-Ongoing-Orders": "true",
+        "Connection": "keep-alive",
+        "Authorization": f"Bearer {token2}",
+        "Accept-Language": "ru;q=1, ru-PL;q=0.9, en-GB;q=0.8",
+        "Accept": "*/*",
+        "X-Yataxi-Ongoing-Orders-Statuses": "taxi=waiting@1",
+        "Content-Type": "application/json",
+        "X-VPN-Active": "1",
+        "Accept-Encoding": "gzip, deflate, br",
+    }
+
+    payload = {
+        "id": trip_id,
+        "version": "DAAAAAAABgAMAAQABgAAADccAGCbAQAA",
+        "supported_promo_actions": [
+            "show_requirement_info",
+            "request_totw_with_key_and_value",
+            "pick_contact_for_totw",
+            "lootbox",
+            "direct_offer",
+            "share_route_button",
+            "deeplink",
+        ],
+        "orderid": orderid,
+        "supported_widgets": [
+            "deeplink_arrow_button",
+            "attributed_text",
+            "toggle",
+            "actions_arrow_button",
+            "action_button",
+            "action_buttons",
+        ],
+        "supported": ["midpointchange", "code_dispatch"],
+        "search_state_info": {},
+        "format_currency": True,
+        "is_multiorder": False,
+    }
+
+    logger.info(
+        "Запрос taxiontheway: headers=%s body=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(payload, ensure_ascii=False),
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://tc.mobile.yandex.net/3.0/taxiontheway",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            resp_text = await resp.text()
+    logger.info("Ответ taxiontheway: %s", _trim_text(resp_text, 2000))
+
+    tariff = None
+    price = None
+    link = None
+    try:
+        data = json.loads(resp_text)
+        tariff_data = data.get("tariff")
+        if isinstance(tariff_data, dict):
+            tariff = tariff_data.get("name")
+        final_cost = data.get("final_cost")
+        if final_cost is not None:
+            price = str(final_cost)
+        link = data.get("route_sharing_url")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return tariff, price, link, resp_text
 
 
 def _generate_random_user_id() -> str:
@@ -1232,6 +1582,7 @@ def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Option
         if match:
             orderid = match.group(1)
 
+    logger.info("Парсинг orderhistory: orderid=%s price=%s", orderid, price)
     return orderid, price
 
 
@@ -1280,6 +1631,11 @@ async def fetch_order_history_orderid(
         "is_updated_masstransit_history_available": True,
     }
 
+    logger.info(
+        "Запрос orderhistory: headers=%s body=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(body, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://m.taxi.yandex.ru/order-history-frontend/api/4.0/orderhistory/v2/list",
@@ -1287,6 +1643,7 @@ async def fetch_order_history_orderid(
             headers=headers,
         ) as resp:
             resp_text = await resp.text()
+    logger.info("Ответ orderhistory: %s", _trim_text(resp_text, 2000))
 
     orderid, price = _extract_orderid_from_history(resp_text)
     return orderid, price, resp_text
@@ -1400,8 +1757,15 @@ async def do_single_request_and_log(
     )
 
 
-def main_keyboard() -> ReplyKeyboardRemove:
-    return ReplyKeyboardRemove()
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["🎄💳 Поменять оплату"],
+            ["Профиль", "Кабинет"],
+            ["🎄📜 Логи", "🎄🚂 Загрузить поездки"],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def actions_keyboard() -> ReplyKeyboardMarkup:
@@ -1530,8 +1894,17 @@ def order_method_keyboard() -> InlineKeyboardMarkup:
 def confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Поменять оплату", callback_data="confirm:change")],
+            [InlineKeyboardButton("Собрать информацию", callback_data="confirm:info")],
             [InlineKeyboardButton("Удалить", callback_data="confirm:delete")],
+        ]
+    )
+
+
+def info_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Поменять оплату", callback_data="info:change")],
+            [InlineKeyboardButton("Отменить", callback_data="info:cancel")],
         ]
     )
 
@@ -2078,6 +2451,8 @@ async def trip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         f"💳 card-x: {record.get('card') or '—'}",
         f"📄 orderid: {record.get('orderid') or '—'}",
         f"🔗 Ссылка: {record.get('trip_link') or '—'}",
+        f"🏷️ Тариф: {record.get('tariff') or '—'}",
+        f"💰 Цена: {record.get('price') or '—'}",
     ]
 
     keyboard = InlineKeyboardMarkup(
@@ -2407,14 +2782,7 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_access
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("token", None)
-    context.user_data.pop("session_cookie", None)
-    context.user_data.pop("orderid", None)
-    context.user_data.pop("card", None)
-    context.user_data.pop("id", None)
-    context.user_data.pop("active_trip_id", None)
-    context.user_data.pop("trip_link", None)
-    context.user_data.pop("device", None)
+    reset_user_trip_context(context)
 
     await safe_reply(
         update,
@@ -2474,6 +2842,19 @@ def _update_trip_fields(
             update_trip_template_field(trip_id, tg_id, field, value)
 
 
+def reset_user_trip_context(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("token", None)
+    context.user_data.pop("session_cookie", None)
+    context.user_data.pop("orderid", None)
+    context.user_data.pop("card", None)
+    context.user_data.pop("id", None)
+    context.user_data.pop("active_trip_id", None)
+    context.user_data.pop("trip_link", None)
+    context.user_data.pop("device", None)
+    context.user_data.pop("tariff", None)
+    context.user_data.pop("price", None)
+
+
 async def _show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orderid = context.user_data.get("orderid")
     card = context.user_data.get("card")
@@ -2499,6 +2880,84 @@ async def _show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(message, parse_mode="HTML", reply_markup=confirm_keyboard())
 
     return ASK_CONFIRM
+
+
+async def collect_trip_info(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+    user = update.effective_user
+    tg_id = user.id if user else None
+    token2 = context.user_data.get("token")
+    session_cookie = context.user_data.get("session_cookie")
+    trip_id = context.user_data.get("id")
+
+    if tg_id is None:
+        return None, None, None, "Не смог получить твой TG ID 🤔"
+
+    if not token2:
+        return None, None, None, "Нужен token2, чтобы собрать информацию."
+
+    orderid = context.user_data.get("orderid")
+    if not orderid:
+        orderid, _ = await fetch_pending_orders_orderid(token2)
+        if orderid:
+            context.user_data["orderid"] = orderid
+            _update_trip_fields(context, tg_id, {"orderid": orderid})
+        else:
+            logger.info("collect_trip_info: orderid не найден.")
+
+    if not orderid or not trip_id:
+        logger.info(
+            "collect_trip_info: отсутствуют данные orderid=%s trip_id=%s",
+            orderid,
+            trip_id,
+        )
+        return (
+            None,
+            None,
+            None,
+            "Не нашёл order id или ID профиля. Проверь данные и попробуй снова.",
+        )
+
+    tariff, price, link, _ = await fetch_taxiontheway_info(token2, orderid, trip_id)
+    logger.info(
+        "collect_trip_info: parsed tariff=%s price=%s link=%s",
+        tariff,
+        price,
+        link,
+    )
+    if tariff:
+        context.user_data["tariff"] = tariff
+    if price:
+        context.user_data["price"] = price
+    if link:
+        context.user_data["trip_link"] = link
+
+    _update_trip_fields(
+        context,
+        tg_id,
+        {
+            "tariff": tariff or "",
+            "price": price or "",
+            "trip_link": link or "",
+        },
+    )
+
+    log_swap_history(
+        tg_id,
+        {
+            "token2": token2,
+            "session_id": session_cookie,
+            "trip_id": trip_id,
+            "card": context.user_data.get("card"),
+            "orderid": orderid,
+            "trip_link": link,
+            "tariff": tariff,
+            "price": price,
+        },
+    )
+
+    return tariff, price, link, ""
 
 
 @require_access
@@ -2560,15 +3019,28 @@ async def token2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     card = parsed.get("card")
     trip_id = parsed.get("trip_id")
+    logger.info("Парсинг token2: trip_id=%s card=%s", trip_id, card)
     context.user_data["card"] = card
     context.user_data["id"] = trip_id
 
     _update_trip_fields(context, tg_id, {"card": card, "trip_id": trip_id})
 
-    await update.message.reply_text(
-        "Как отправить order id?", reply_markup=order_method_keyboard()
-    )
-    return ASK_ORDER_METHOD
+    if not trip_id:
+        context.user_data["pending_token2_id"] = True
+        await update.message.reply_text(
+            "Не нашёл ID профиля. Отправь ID вручную:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_TOKEN2_ID
+
+    orderid, _ = await fetch_pending_orders_orderid(token2)
+    if orderid:
+        context.user_data["orderid"] = orderid
+        _update_trip_fields(context, tg_id, {"orderid": orderid})
+    else:
+        logger.info("Не удалось получить orderid из pending-orders.")
+
+    return await _show_confirmation(update, context)
 
 
 @require_access
@@ -2637,6 +3109,30 @@ async def order_raw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_access
+async def token2_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    trip_id = update.message.text.strip()
+    context.user_data["id"] = trip_id
+    context.user_data.pop("pending_token2_id", None)
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id:
+        _update_trip_fields(context, tg_id, {"trip_id": trip_id})
+
+    token2 = context.user_data.get("token")
+    if token2:
+        orderid, _ = await fetch_pending_orders_orderid(token2)
+        if orderid:
+            context.user_data["orderid"] = orderid
+            if tg_id:
+                _update_trip_fields(context, tg_id, {"orderid": orderid})
+        else:
+            logger.info("Не удалось получить orderid из pending-orders после ввода ID.")
+
+    return await _show_confirmation(update, context)
+
+
+@require_access
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2650,14 +3146,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tg_id and trip_id:
             delete_trip_template(trip_id, tg_id)
 
-        context.user_data.pop("token", None)
-        context.user_data.pop("session_cookie", None)
-        context.user_data.pop("orderid", None)
-        context.user_data.pop("card", None)
-        context.user_data.pop("id", None)
-        context.user_data.pop("active_trip_id", None)
-        context.user_data.pop("trip_link", None)
-        context.user_data.pop("device", None)
+        reset_user_trip_context(context)
 
         await query.message.reply_text(
             "Данные удалены. Возвращаю в главное меню.",
@@ -2665,14 +3154,34 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_DEVICE
 
-    if choice == "change":
-        context.user_data["threads"] = 300
-        context.user_data["pending_bulk"] = {"threads": 300, "total": 600}
-        await query.message.reply_text(
-            "Запускаю смену оплаты...",
-            reply_markup=ReplyKeyboardRemove(),
+    if choice == "info":
+        tariff, price, link, error = await collect_trip_info(update, context)
+        if error:
+            await query.message.reply_text(error, reply_markup=main_keyboard())
+            return MENU
+
+        orderid = context.user_data.get("orderid") or "—"
+        card = context.user_data.get("card") or "—"
+        trip_id = context.user_data.get("id") or "—"
+        token2 = context.user_data.get("token")
+        session_cookie = context.user_data.get("session_cookie")
+        auth_text = token2 or session_cookie or "—"
+        auth_label = "token2" if token2 else "session_id"
+
+        message = (
+            "📌 Собранная информация:\n\n"
+            f"Цена поездки: <b>{html.escape(str(price or '—'))}</b>\n"
+            f"Тариф: <b>{html.escape(str(tariff or '—'))}</b>\n"
+            f"Ссылка: <code>{html.escape(str(link or '—'))}</code>\n\n"
+            f"📄 orderid: <code>{html.escape(str(orderid))}</code>\n"
+            f"🔑 {auth_label}: <code>{html.escape(str(auth_text))}</code>\n"
+            f"🪪 ID: <code>{html.escape(str(trip_id))}</code>\n"
+            f"💳 card-x: <code>{html.escape(str(card))}</code>"
         )
-        await bulk_change_payment(update, context, 300, 600)
+
+        await query.message.reply_text(
+            message, parse_mode="HTML", reply_markup=info_actions_keyboard()
+        )
         return MENU
 
     await query.message.reply_text(
@@ -2710,6 +3219,37 @@ async def access_token_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(
         "Отлично! Токен принят, можешь пользоваться ботом.",
         reply_markup=main_keyboard(),
+    )
+    return MENU
+
+
+@require_access
+async def info_actions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await delete_callback_message(query)
+    choice = query.data.split(":", 1)[1] if ":" in query.data else ""
+
+    if choice == "cancel":
+        reset_user_trip_context(context)
+        await query.message.reply_text(
+            "Отменил и очистил данные. Возвращаю в главное меню.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    if choice == "change":
+        context.user_data["threads"] = 300
+        context.user_data["pending_bulk"] = {"threads": 300, "total": 600}
+        await query.message.reply_text(
+            "Запускаю смену оплаты...",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await bulk_change_payment(update, context, 300, 600)
+        return MENU
+
+    await query.message.reply_text(
+        "Не понял выбор. Попробуй ещё раз.", reply_markup=info_actions_keyboard()
     )
     return MENU
 
@@ -2841,8 +3381,11 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Возвращаюсь в меню ↩️.", reply_markup=main_keyboard())
         return MENU
 
-    if text == "🎄👤 Профиль":
+    if text in {"🎄👤 Профиль", "Профиль"}:
         return await show_profile(update, context)
+
+    if text == "Кабинет":
+        return await show_cabinet(update, context)
 
     if text == "🎄📜 Логи":
         await update.message.reply_text("Что показать? 📂", reply_markup=logs_keyboard())
@@ -2899,6 +3442,148 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         msg,
         parse_mode="HTML",
+        reply_markup=main_keyboard(),
+    )
+    return MENU
+
+
+@require_access
+async def show_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    tg_id = user.id if user else None
+
+    if tg_id is None:
+        await update.message.reply_text(
+            "Не смог получить твой TG ID 🤔",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    total_swaps = get_swap_history_count(tg_id)
+    recent = list_recent_swaps(tg_id, limit=5)
+
+    msg_lines = [
+        "📂 Кабинет",
+        f"Всего подмен: <b>{total_swaps}</b>",
+    ]
+
+    keyboard: List[List[InlineKeyboardButton]] = []
+    if recent:
+        msg_lines.append("\nПоследние 5 подмен:")
+        for item in recent:
+            label = (
+                item.get("created_at")
+                or f"Подмена #{item.get('id')}"
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"cabinet:item:{item['id']}",
+                    )
+                ]
+            )
+
+    keyboard.append([InlineKeyboardButton("Выгрузить все смены", callback_data="cabinet:export")])
+
+    await update.message.reply_text(
+        "\n".join(msg_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return MENU
+
+
+@require_access
+async def cabinet_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await delete_callback_message(query)
+
+    try:
+        _, _, swap_id_str = query.data.split(":", 2)
+        swap_id = int(swap_id_str)
+    except Exception:  # noqa: BLE001
+        await query.message.reply_text(
+            "Не понял, какую подмену открыть.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.message.reply_text(
+            "Не смог получить твой TG ID 🤔",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    record = get_swap_by_id(tg_id, swap_id)
+    if not record:
+        await query.message.reply_text(
+            "Не нашёл эту подмену.", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    token2 = record.get("token2")
+    session_id = record.get("session_id")
+    auth_text = token2 or session_id or "—"
+    auth_label = "token2" if token2 else "session_id"
+
+    message = (
+        f"💰 Стоимость: <b>{html.escape(str(record.get('price') or '—'))}</b>\n"
+        f"🏷️ Тариф: <b>{html.escape(str(record.get('tariff') or '—'))}</b>\n"
+        f"🔗 Ссылка: <code>{html.escape(str(record.get('trip_link') or '—'))}</code>\n"
+        f"🔑 {auth_label}: <code>{html.escape(str(auth_text))}</code>"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Выгрузить все смены", callback_data="cabinet:export")]]
+    )
+
+    await query.message.reply_text(
+        message, parse_mode="HTML", reply_markup=keyboard
+    )
+    return MENU
+
+
+@require_access
+async def cabinet_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await delete_callback_message(query)
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.message.reply_text(
+            "Не смог получить твой TG ID 🤔",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    path = export_swaps_to_file(tg_id)
+    if path is None:
+        await query.message.reply_text(
+            "Пока нет сохранённых подмен для выгрузки.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    try:
+        with open(path, "rb") as f:
+            await query.message.reply_document(
+                document=InputFile(f, filename=f"swaps_{tg_id}.txt"),
+                caption="Выгрузка всех подмен",
+            )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    await query.message.reply_text(
+        "Готово ✅",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -3550,6 +4235,9 @@ def build_application() -> "Application":
             ASK_TOKEN2: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, token2_handler)
             ],
+            ASK_TOKEN2_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, token2_id_handler)
+            ],
             ASK_ORDER_METHOD: [
                 CallbackQueryHandler(order_method_callback, pattern="^order:")
             ],
@@ -3574,6 +4262,9 @@ def build_application() -> "Application":
                 CallbackQueryHandler(trip_edit_callback, pattern="^tripedit:"),
                 CallbackQueryHandler(trip_delete_callback, pattern="^tripdelete:"),
                 CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
+                CallbackQueryHandler(info_actions_callback, pattern="^info:"),
+                CallbackQueryHandler(cabinet_item_callback, pattern="^cabinet:item:"),
+                CallbackQueryHandler(cabinet_export_callback, pattern="^cabinet:export"),
                 CallbackQueryHandler(start_choice_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
             ],
