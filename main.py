@@ -860,7 +860,7 @@ def list_recent_swaps(tg_id: int, limit: int = 5) -> List[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, tariff, price, trip_link, token2, session_id, created_at
+        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, created_at
         FROM swap_history
         WHERE tg_id = ?
         ORDER BY id DESC
@@ -877,6 +877,9 @@ def list_recent_swaps(tg_id: int, limit: int = 5) -> List[dict]:
         "trip_link",
         "token2",
         "session_id",
+        "orderid",
+        "card",
+        "trip_id",
         "created_at",
     ]
     return [dict(zip(keys, row)) for row in rows]
@@ -1399,6 +1402,10 @@ def _generate_random_user_id() -> str:
     return "".join(mixed)
 
 
+def _generate_random_digits(length: int = 10) -> str:
+    return "".join(random.choice("0123456789") for _ in range(length))
+
+
 def _pretty_json_or_text(raw: str) -> str:
     try:
         parsed = json.loads(raw)
@@ -1649,6 +1656,69 @@ async def fetch_order_history_orderid(
     return orderid, price, resp_text
 
 
+async def fetch_order_history_orderid_by_token(
+    token2: str, trip_id: str
+) -> Tuple[Optional[str], str]:
+    headers = {
+        "Authorization": f"Bearer {token2}",
+        "Accept-Language": "ru",
+        "X-YaTaxi-UserId": trip_id,
+        "Content-Type": "application/json",
+    }
+
+    cookies = {
+        "_yasc": "skVe3rBnIioqnFEVvmkDRI99q1W/Td7rxsREOV9mnPBqdHqSC6eqFu26pY996A==",
+        "i": "p5yJ9tAaPd9efqcbp5l6+U19BEtSfOwUoaWRQSq3jtw54K4wnLFaAdr6BmuJGcUl18p6zGvIooMdKbN28EbcxIhMFGI=",
+        "yandexuid": _generate_random_digits(),
+        "yashr": _generate_random_digits(),
+    }
+
+    body = {
+        "services": {"taxi": {"image_tags": {"size_hint": 9999}, "flavors": ["default"]}},
+        "range": {"results": 20},
+        "include_service_metadata": True,
+    }
+
+    logger.info(
+        "Запрос orderhistory (token2): headers=%s body=%s cookies=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(body, ensure_ascii=False),
+        json.dumps(cookies, ensure_ascii=False),
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://ya-authproxy.taxi.yandex.ru/4.0/orderhistory/v2/list",
+            json=body,
+            headers=headers,
+            cookies=cookies,
+        ) as resp:
+            resp_text = await resp.text()
+    logger.info("Ответ orderhistory (token2): %s", _trim_text(resp_text, 2000))
+
+    orderid = None
+    try:
+        payload = json.loads(resp_text)
+        orders = payload.get("orders")
+        if isinstance(orders, list):
+            for item in orders:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("service") != "taxi":
+                    continue
+                data = item.get("data")
+                if not isinstance(data, dict):
+                    continue
+                raw_orderid = data.get("order_id")
+                if raw_orderid:
+                    orderid = str(raw_orderid)
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+    logger.info("Парсинг orderhistory (token2): orderid=%s", orderid)
+    return orderid, resp_text
+
+
 async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) -> str:
     try:
         parsed = await fetch_session_details(session_id)
@@ -1760,24 +1830,14 @@ async def do_single_request_and_log(
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["🎄💳 Поменять оплату"],
-            ["Профиль", "Кабинет"],
-            ["🎄📜 Логи", "🎄🚂 Загрузить поездки"],
+            ["Профиль"],
         ],
         resize_keyboard=True,
     )
 
 
 def actions_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["🎄🎯 Одиночная смена"],
-            ["🎄🚀 Запустить потоки"],
-            ["🎄🛑 Остановить потоки"],
-            ["🎄🔙 Назад"],
-        ],
-        resize_keyboard=True,
-    )
+    return main_keyboard()
 
 
 def _collect_progress_snapshot(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int, str, dict]:
@@ -1863,14 +1923,7 @@ async def restart_bot(context: ContextTypes.DEFAULT_TYPE):
 
 
 def logs_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["🎄📖 Посмотреть логи"],
-            ["🎄🕒 Логи последней сессии"],
-            ["🎄🔙 Назад"],
-        ],
-        resize_keyboard=True,
-    )
+    return main_keyboard()
 
 
 def device_choice_keyboard() -> InlineKeyboardMarkup:
@@ -3026,10 +3079,17 @@ async def token2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_TOKEN2_ID
 
-    await update.message.reply_text(
-        "Отправь order id:", reply_markup=ReplyKeyboardRemove()
-    )
-    return ASK_ORDER_RAW
+    orderid, _ = await fetch_order_history_orderid_by_token(token2, trip_id)
+    if not orderid:
+        await update.message.reply_text(
+            "Не смог автоматически найти order id. Попробуй ещё раз позже.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    context.user_data["orderid"] = orderid
+    _update_trip_fields(context, tg_id, {"orderid": orderid})
+    return await _show_confirmation(update, context)
 
 
 @require_access
@@ -3108,10 +3168,26 @@ async def token2_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tg_id:
         _update_trip_fields(context, tg_id, {"trip_id": trip_id})
 
-    await update.message.reply_text(
-        "Отправь order id:", reply_markup=ReplyKeyboardRemove()
-    )
-    return ASK_ORDER_RAW
+    token2 = context.user_data.get("token")
+    if not token2:
+        await update.message.reply_text(
+            "Не нашёл token2. Попробуй отправить его заново.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    orderid, _ = await fetch_order_history_orderid_by_token(token2, trip_id)
+    if not orderid:
+        await update.message.reply_text(
+            "Не смог автоматически найти order id. Попробуй ещё раз позже.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    context.user_data["orderid"] = orderid
+    if tg_id:
+        _update_trip_fields(context, tg_id, {"orderid": orderid})
+    return await _show_confirmation(update, context)
 
 
 @require_access
@@ -3304,12 +3380,7 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Все параметры сохранены ✅\n\n"
-        "Теперь ты можешь:\n"
-        "• Через «🎄💳 Поменять оплату» → «🎄🎯 Одиночная смена» — один POST-запрос.\n"
-        "• Через «🎄💳 Поменять оплату» → «🎄🚀 Запустить потоки» — массовая отправка.\n"
-        "• «🎄👤 Профиль» — статистика.\n"
-        "• «🎄📜 Логи» — меню для выгрузки логов.\n"
-        "• «🎄🚂 Загрузить поездки» — добавление и редактирование поездок.",
+        "Теперь доступна кнопка «Профиль» — там статистика и история смен оплат.",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -3387,7 +3458,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await show_trip_loader(update, context)
 
     await update.message.reply_text(
-        "Не понял команду. Используй кнопки на клавиатуре.",
+        "Не понял команду. Используй кнопку «Профиль».",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -3406,25 +3477,55 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MENU
 
     total_requests = get_request_count_for_user(tg_id)
+    total_swaps = get_swap_history_count(tg_id)
+    recent_swaps = list_recent_swaps(tg_id, limit=5)
     last_session_id = context.user_data.get("last_session_id")
     proxy_state = proxy_state_text()
 
-    msg = (
-        f"🎄👤 Профиль\n\n"
-        f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
-        f"Всего отправлено запросов: <b>{total_requests}</b>\n"
-        f"Прокси: {proxy_state}\n"
-    )
+    msg_lines = [
+        "🎄👤 Профиль",
+        "",
+        f"TG ID: <code>{html.escape(str(tg_id))}</code>",
+        f"Всего отправлено запросов: <b>{total_requests}</b>",
+        f"Всего смен оплат: <b>{total_swaps}</b>",
+        f"Прокси: {proxy_state}",
+    ]
 
     if last_session_id:
-        msg += f"\nПоследний ID сессии: <code>{html.escape(str(last_session_id))}</code>\n"
+        msg_lines.append(f"Последний ID сессии: <code>{html.escape(str(last_session_id))}</code>")
 
-    msg += "\nКнопка «🎄🕒 Логи последней сессии» сразу скинет .txt по последней сессии."
+    if recent_swaps:
+        msg_lines.append("")
+        msg_lines.append("Последние 5 смен оплат:")
+        for item in recent_swaps:
+            msg_lines.extend(
+                [
+                    f"\nЗапись #{html.escape(str(item.get('id', '—')))}",
+                    f"Время: {html.escape(str(item.get('created_at') or '—'))}",
+                    f"Цена: {html.escape(str(item.get('price') or '—'))}",
+                    f"Тариф: {html.escape(str(item.get('tariff') or '—'))}",
+                    f"Ссылка: {html.escape(str(item.get('trip_link') or '—'))}",
+                    f"token2: {html.escape(str(item.get('token2') or '—'))}",
+                    f"session_id: {html.escape(str(item.get('session_id') or '—'))}",
+                    f"orderid: {html.escape(str(item.get('orderid') or '—'))}",
+                    f"card-x: {html.escape(str(item.get('card') or '—'))}",
+                    f"ID: {html.escape(str(item.get('trip_id') or '—'))}",
+                ]
+            )
+    else:
+        msg_lines.append("")
+        msg_lines.append("Смен оплат пока нет.")
 
     await update.message.reply_text(
-        msg,
+        "\n".join(msg_lines),
         parse_mode="HTML",
         reply_markup=main_keyboard(),
+    )
+    await update.message.reply_text(
+        "Выгрузка смен оплат:",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Выгрузить все смены оплат", callback_data="cabinet:export")]]
+        ),
     )
     return MENU
 
