@@ -2898,13 +2898,6 @@ async def collect_trip_info(
         return None, None, None, "Нужен token2, чтобы собрать информацию."
 
     orderid = context.user_data.get("orderid")
-    if not orderid:
-        orderid, _ = await fetch_pending_orders_orderid(token2)
-        if orderid:
-            context.user_data["orderid"] = orderid
-            _update_trip_fields(context, tg_id, {"orderid": orderid})
-        else:
-            logger.info("collect_trip_info: orderid не найден.")
 
     if not orderid or not trip_id:
         logger.info(
@@ -2990,9 +2983,9 @@ async def session_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     _update_trip_fields(context, tg_id, {"card": card, "trip_id": trip_id})
 
     await update.message.reply_text(
-        "Как отправить order id?", reply_markup=order_method_keyboard()
+        "Отправь order id:", reply_markup=ReplyKeyboardRemove()
     )
-    return ASK_ORDER_METHOD
+    return ASK_ORDER_RAW
 
 
 @require_access
@@ -3033,14 +3026,10 @@ async def token2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_TOKEN2_ID
 
-    orderid, _ = await fetch_pending_orders_orderid(token2)
-    if orderid:
-        context.user_data["orderid"] = orderid
-        _update_trip_fields(context, tg_id, {"orderid": orderid})
-    else:
-        logger.info("Не удалось получить orderid из pending-orders.")
-
-    return await _show_confirmation(update, context)
+    await update.message.reply_text(
+        "Отправь order id:", reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_ORDER_RAW
 
 
 @require_access
@@ -3119,17 +3108,10 @@ async def token2_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tg_id:
         _update_trip_fields(context, tg_id, {"trip_id": trip_id})
 
-    token2 = context.user_data.get("token")
-    if token2:
-        orderid, _ = await fetch_pending_orders_orderid(token2)
-        if orderid:
-            context.user_data["orderid"] = orderid
-            if tg_id:
-                _update_trip_fields(context, tg_id, {"orderid": orderid})
-        else:
-            logger.info("Не удалось получить orderid из pending-orders после ввода ID.")
-
-    return await _show_confirmation(update, context)
+    await update.message.reply_text(
+        "Отправь order id:", reply_markup=ReplyKeyboardRemove()
+    )
+    return ASK_ORDER_RAW
 
 
 @require_access
