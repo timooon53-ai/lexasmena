@@ -1,0 +1,4 @@
+requests==2.32.3
+aiohttp==3.10.10
+python-telegram-bot==20.8
+vk_api==11.9.1
