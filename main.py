@@ -1402,6 +1402,10 @@ def _generate_random_user_id() -> str:
     return "".join(mixed)
 
 
+def _generate_random_digits(length: int = 10) -> str:
+    return "".join(random.choice("0123456789") for _ in range(length))
+
+
 def _pretty_json_or_text(raw: str) -> str:
     try:
         parsed = json.loads(raw)
@@ -1650,6 +1654,69 @@ async def fetch_order_history_orderid(
 
     orderid, price = _extract_orderid_from_history(resp_text)
     return orderid, price, resp_text
+
+
+async def fetch_order_history_orderid_by_token(
+    token2: str, trip_id: str
+) -> Tuple[Optional[str], str]:
+    headers = {
+        "Authorization": f"Bearer {token2}",
+        "Accept-Language": "ru",
+        "X-YaTaxi-UserId": trip_id,
+        "Content-Type": "application/json",
+    }
+
+    cookies = {
+        "_yasc": "skVe3rBnIioqnFEVvmkDRI99q1W/Td7rxsREOV9mnPBqdHqSC6eqFu26pY996A==",
+        "i": "p5yJ9tAaPd9efqcbp5l6+U19BEtSfOwUoaWRQSq3jtw54K4wnLFaAdr6BmuJGcUl18p6zGvIooMdKbN28EbcxIhMFGI=",
+        "yandexuid": _generate_random_digits(),
+        "yashr": _generate_random_digits(),
+    }
+
+    body = {
+        "services": {"taxi": {"image_tags": {"size_hint": 9999}, "flavors": ["default"]}},
+        "range": {"results": 20},
+        "include_service_metadata": True,
+    }
+
+    logger.info(
+        "Запрос orderhistory (token2): headers=%s body=%s cookies=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(body, ensure_ascii=False),
+        json.dumps(cookies, ensure_ascii=False),
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://ya-authproxy.taxi.yandex.ru/4.0/orderhistory/v2/list",
+            json=body,
+            headers=headers,
+            cookies=cookies,
+        ) as resp:
+            resp_text = await resp.text()
+    logger.info("Ответ orderhistory (token2): %s", _trim_text(resp_text, 2000))
+
+    orderid = None
+    try:
+        payload = json.loads(resp_text)
+        orders = payload.get("orders")
+        if isinstance(orders, list):
+            for item in orders:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("service") != "taxi":
+                    continue
+                data = item.get("data")
+                if not isinstance(data, dict):
+                    continue
+                raw_orderid = data.get("order_id")
+                if raw_orderid:
+                    orderid = str(raw_orderid)
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+    logger.info("Парсинг orderhistory (token2): orderid=%s", orderid)
+    return orderid, resp_text
 
 
 async def autofill_trip_from_session(trip_id: int, tg_id: int, session_id: str) -> str:
@@ -3012,10 +3079,17 @@ async def token2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_TOKEN2_ID
 
-    await update.message.reply_text(
-        "Отправь order id:", reply_markup=ReplyKeyboardRemove()
-    )
-    return ASK_ORDER_RAW
+    orderid, _ = await fetch_order_history_orderid_by_token(token2, trip_id)
+    if not orderid:
+        await update.message.reply_text(
+            "Не смог автоматически найти order id. Попробуй ещё раз позже.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    context.user_data["orderid"] = orderid
+    _update_trip_fields(context, tg_id, {"orderid": orderid})
+    return await _show_confirmation(update, context)
 
 
 @require_access
@@ -3094,10 +3168,26 @@ async def token2_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tg_id:
         _update_trip_fields(context, tg_id, {"trip_id": trip_id})
 
-    await update.message.reply_text(
-        "Отправь order id:", reply_markup=ReplyKeyboardRemove()
-    )
-    return ASK_ORDER_RAW
+    token2 = context.user_data.get("token")
+    if not token2:
+        await update.message.reply_text(
+            "Не нашёл token2. Попробуй отправить его заново.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    orderid, _ = await fetch_order_history_orderid_by_token(token2, trip_id)
+    if not orderid:
+        await update.message.reply_text(
+            "Не смог автоматически найти order id. Попробуй ещё раз позже.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    context.user_data["orderid"] = orderid
+    if tg_id:
+        _update_trip_fields(context, tg_id, {"orderid": orderid})
+    return await _show_confirmation(update, context)
 
 
 @require_access
@@ -3429,6 +3519,10 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\n".join(msg_lines),
         parse_mode="HTML",
+        reply_markup=main_keyboard(),
+    )
+    await update.message.reply_text(
+        "Выгрузка смен оплат:",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("Выгрузить все смены оплат", callback_data="cabinet:export")]]
         ),
