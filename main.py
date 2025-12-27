@@ -2072,14 +2072,19 @@ async def do_single_request_and_log(
     )
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            ["🎄💳 Поменять оплату", "🎄👤 Профиль"],
-            ["🎄📜 Логи", "🎄🚂 Загрузить поездки"],
-            ["🛠️ Админка"],
-        ],
-        resize_keyboard=True,
+            [
+                InlineKeyboardButton(
+                    "🎄💳 Поменять оплату", callback_data="main:change"
+                )
+            ],
+            [
+                InlineKeyboardButton("🎄👤 Профиль", callback_data="main:profile"),
+                InlineKeyboardButton("🛠️ Админка", callback_data="main:admin"),
+            ],
+        ]
     )
 
 
@@ -3099,10 +3104,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(
         update,
         context,
-        "Привет! Выбери своё устройство 👇",
-        reply_markup=device_choice_keyboard(),
+        "Привет! Выбери действие 👇",
+        reply_markup=main_keyboard(),
     )
-    return ASK_DEVICE
+    return MENU
 
 
 @require_access
@@ -3632,14 +3637,42 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_access
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await delete_callback_message(query)
+
+    action = query.data.split(":", 1)[1] if ":" in query.data else ""
+    if action == "change":
+        reset_user_trip_context(context)
+        await query.message.reply_text(
+            "Выбери своё устройство 👇",
+            reply_markup=device_choice_keyboard(),
+        )
+        return ASK_DEVICE
+
+    if action == "profile":
+        return await show_profile(update, context)
+
+    if action == "admin":
+        return await show_admin_panel(update, context)
+
+    await query.message.reply_text(
+        "Не понял выбор 🤔", reply_markup=main_keyboard()
+    )
+    return MENU
+
+
+@require_access
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    if text == "🎄💳 Поменять оплату":
+    if text in {"🎄💳 Поменять оплату", "Поменять оплату"}:
+        reset_user_trip_context(context)
         await update.message.reply_text(
-            "Выбери действие ⤵️:", reply_markup=actions_keyboard()
+            "Выбери своё устройство 👇", reply_markup=device_choice_keyboard()
         )
-        return MENU
+        return ASK_DEVICE
 
     if text == "🎄🎯 Одиночная смена":
         proxy_state = proxy_state_text()
@@ -3703,7 +3736,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await show_trip_loader(update, context)
 
     await update.message.reply_text(
-        "Не понял команду. Используй кнопку «Профиль».",
+        "Используй кнопки меню ниже 👇",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -4944,6 +4977,7 @@ def build_application() -> "Application":
                 CallbackQueryHandler(confirm_callback, pattern="^confirm:")
             ],
             MENU: [
+                CallbackQueryHandler(main_menu_callback, pattern="^main:"),
                 CallbackQueryHandler(admin_callback_router, pattern="^admin:"),
                 CallbackQueryHandler(tripfield_callback, pattern="^tripfield:"),
                 CallbackQueryHandler(trip_save_callback, pattern="^tripsave:"),
