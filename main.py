@@ -75,11 +75,16 @@ PROXY_FILE: Final = Path(os.getenv("PROXY_FILE_PATH") or (BASE_DIR / "proxy.txt"
     ASK_ORDER_LINK,
     ASK_ORDER_RAW,
     ASK_CONFIRM,
-) = range(26)
+    ASK_TOKEN2_ID,
+) = range(27)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(Path(__file__).resolve().parent / "bot.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -265,6 +270,12 @@ class ChangePaymentClient:
             used_proxy = proxy
 
             try:
+                logger.info(
+                    "Отправка запроса changepayment: proxy=%s headers=%s body=%s",
+                    proxy,
+                    json.dumps(headers, ensure_ascii=False),
+                    json.dumps(payload, ensure_ascii=False),
+                )
                 async with self._session.post(
                     self.base_url,
                     json=payload,
@@ -273,9 +284,15 @@ class ChangePaymentClient:
                     timeout=timeout,
                 ) as resp:
                     text = await resp.text()
+                    logger.info(
+                        "Ответ changepayment: status=%s body=%s",
+                        resp.status,
+                        _trim_text(text, 2000),
+                    )
                     return True, resp.status, text, proxy
             except Exception as e:  # noqa: BLE001
                 last_exc = str(e)
+                logger.warning("Ошибка запроса changepayment: %s", last_exc)
 
         return False, None, last_exc, used_proxy
 
@@ -1114,11 +1131,17 @@ async def fetch_session_details(session_id: str) -> dict:
     cookies = {"Session_id": session_id}
     result: dict = {"session_id": session_id, "_debug_responses": []}
 
+    logger.info(
+        "Запрос launch по session_id: headers=%s cookies=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(cookies, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers, cookies=cookies
         ) as resp:
             launch_text = await resp.text()
+    logger.info("Ответ launch по session_id: %s", _trim_text(launch_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -1139,6 +1162,11 @@ async def fetch_session_details(session_id: str) -> dict:
 
     payload = json.dumps({"id": result["trip_id"]}, ensure_ascii=False)
 
+    logger.info(
+        "Запрос paymentmethods по session_id: headers=%s body=%s",
+        json.dumps(payment_headers, ensure_ascii=False),
+        payload,
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/paymentmethods",
@@ -1147,6 +1175,7 @@ async def fetch_session_details(session_id: str) -> dict:
             cookies=cookies,
         ) as resp:
             payment_text = await resp.text()
+    logger.info("Ответ paymentmethods по session_id: %s", _trim_text(payment_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -1186,11 +1215,16 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
 
     result: dict = {"token2": token2, "_debug_responses": []}
 
+    logger.info(
+        "Запрос launch по token2: headers=%s",
+        json.dumps(headers, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/launch", json={}, headers=headers
         ) as resp:
             launch_text = await resp.text()
+    logger.info("Ответ launch по token2: %s", _trim_text(launch_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -1211,6 +1245,11 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
 
     payload = json.dumps({"id": result["trip_id"]}, ensure_ascii=False)
 
+    logger.info(
+        "Запрос paymentmethods по token2: headers=%s body=%s",
+        json.dumps(payment_headers, ensure_ascii=False),
+        payload,
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/paymentmethods",
@@ -1218,6 +1257,7 @@ async def fetch_trip_details_from_token(token2: str) -> dict:
             headers=payment_headers,
         ) as resp:
             payment_text = await resp.text()
+    logger.info("Ответ paymentmethods по token2: %s", _trim_text(payment_text, 2000))
 
     result["_debug_responses"].append(
         {
@@ -1248,11 +1288,16 @@ async def fetch_pending_orders_orderid(token2: str) -> Tuple[Optional[str], str]
     }
 
     async with aiohttp.ClientSession() as session:
+        logger.info(
+            "Запрос pending-orders: headers=%s",
+            json.dumps(headers, ensure_ascii=False),
+        )
         async with session.get(
             "https://tc.mobile.yandex.net/4.0/pending-orders/v1/orders",
             headers=headers,
         ) as resp:
             resp_text = await resp.text()
+    logger.info("Ответ pending-orders: %s", _trim_text(resp_text, 2000))
 
     orderid = None
     try:
@@ -1314,6 +1359,11 @@ async def fetch_taxiontheway_info(
         "is_multiorder": False,
     }
 
+    logger.info(
+        "Запрос taxiontheway: headers=%s body=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(payload, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://tc.mobile.yandex.net/3.0/taxiontheway",
@@ -1321,6 +1371,7 @@ async def fetch_taxiontheway_info(
             headers=headers,
         ) as resp:
             resp_text = await resp.text()
+    logger.info("Ответ taxiontheway: %s", _trim_text(resp_text, 2000))
 
     tariff = None
     price = None
@@ -1531,6 +1582,7 @@ def _extract_orderid_from_history(resp_text: str) -> Tuple[Optional[str], Option
         if match:
             orderid = match.group(1)
 
+    logger.info("Парсинг orderhistory: orderid=%s price=%s", orderid, price)
     return orderid, price
 
 
@@ -1579,6 +1631,11 @@ async def fetch_order_history_orderid(
         "is_updated_masstransit_history_available": True,
     }
 
+    logger.info(
+        "Запрос orderhistory: headers=%s body=%s",
+        json.dumps(headers, ensure_ascii=False),
+        json.dumps(body, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://m.taxi.yandex.ru/order-history-frontend/api/4.0/orderhistory/v2/list",
@@ -1586,6 +1643,7 @@ async def fetch_order_history_orderid(
             headers=headers,
         ) as resp:
             resp_text = await resp.text()
+    logger.info("Ответ orderhistory: %s", _trim_text(resp_text, 2000))
 
     orderid, price = _extract_orderid_from_history(resp_text)
     return orderid, price, resp_text
@@ -1703,7 +1761,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["🎄💳 Поменять оплату"],
-            ["🎄👤 Профиль", "Кабинет"],
+            ["Профиль", "Кабинет"],
             ["🎄📜 Логи", "🎄🚂 Загрузить поездки"],
         ],
         resize_keyboard=True,
@@ -2845,8 +2903,15 @@ async def collect_trip_info(
         if orderid:
             context.user_data["orderid"] = orderid
             _update_trip_fields(context, tg_id, {"orderid": orderid})
+        else:
+            logger.info("collect_trip_info: orderid не найден.")
 
     if not orderid or not trip_id:
+        logger.info(
+            "collect_trip_info: отсутствуют данные orderid=%s trip_id=%s",
+            orderid,
+            trip_id,
+        )
         return (
             None,
             None,
@@ -2855,6 +2920,12 @@ async def collect_trip_info(
         )
 
     tariff, price, link, _ = await fetch_taxiontheway_info(token2, orderid, trip_id)
+    logger.info(
+        "collect_trip_info: parsed tariff=%s price=%s link=%s",
+        tariff,
+        price,
+        link,
+    )
     if tariff:
         context.user_data["tariff"] = tariff
     if price:
@@ -2948,15 +3019,26 @@ async def token2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     card = parsed.get("card")
     trip_id = parsed.get("trip_id")
+    logger.info("Парсинг token2: trip_id=%s card=%s", trip_id, card)
     context.user_data["card"] = card
     context.user_data["id"] = trip_id
 
     _update_trip_fields(context, tg_id, {"card": card, "trip_id": trip_id})
 
+    if not trip_id:
+        context.user_data["pending_token2_id"] = True
+        await update.message.reply_text(
+            "Не нашёл ID профиля. Отправь ID вручную:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_TOKEN2_ID
+
     orderid, _ = await fetch_pending_orders_orderid(token2)
     if orderid:
         context.user_data["orderid"] = orderid
         _update_trip_fields(context, tg_id, {"orderid": orderid})
+    else:
+        logger.info("Не удалось получить orderid из pending-orders.")
 
     return await _show_confirmation(update, context)
 
@@ -3022,6 +3104,30 @@ async def order_raw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = user.id if user else None
     if tg_id:
         _update_trip_fields(context, tg_id, {"orderid": orderid})
+
+    return await _show_confirmation(update, context)
+
+
+@require_access
+async def token2_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    trip_id = update.message.text.strip()
+    context.user_data["id"] = trip_id
+    context.user_data.pop("pending_token2_id", None)
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id:
+        _update_trip_fields(context, tg_id, {"trip_id": trip_id})
+
+    token2 = context.user_data.get("token")
+    if token2:
+        orderid, _ = await fetch_pending_orders_orderid(token2)
+        if orderid:
+            context.user_data["orderid"] = orderid
+            if tg_id:
+                _update_trip_fields(context, tg_id, {"orderid": orderid})
+        else:
+            logger.info("Не удалось получить orderid из pending-orders после ввода ID.")
 
     return await _show_confirmation(update, context)
 
@@ -3275,7 +3381,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Возвращаюсь в меню ↩️.", reply_markup=main_keyboard())
         return MENU
 
-    if text == "🎄👤 Профиль":
+    if text in {"🎄👤 Профиль", "Профиль"}:
         return await show_profile(update, context)
 
     if text == "Кабинет":
@@ -4128,6 +4234,9 @@ def build_application() -> "Application":
             ],
             ASK_TOKEN2: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, token2_handler)
+            ],
+            ASK_TOKEN2_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, token2_id_handler)
             ],
             ASK_ORDER_METHOD: [
                 CallbackQueryHandler(order_method_callback, pattern="^order:")
