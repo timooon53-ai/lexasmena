@@ -1135,9 +1135,9 @@ def format_balance(balance: float) -> str:
 
 
 def is_admin_user(user) -> bool:
-    if not user or ADMIN_TG_ID is None:
+    if not user:
         return False
-    return user.id == ADMIN_TG_ID
+    return is_user_allowed(user)
 
 
 async def ensure_trip_info_for_success(
@@ -3685,9 +3685,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in {"🛠️ Админка", "Админка", "/admin"}:
         return await show_admin_panel(update, context)
 
-    if text == "Кабинет":
-        return await show_cabinet(update, context)
-
     if text == "🎄📜 Логи":
         await update.message.reply_text("Что показать? 📂", reply_markup=logs_keyboard())
         return MENU
@@ -4213,105 +4210,6 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     await query.message.reply_text(
         "Не понял команду админки 🤔", reply_markup=main_keyboard()
-    )
-    return MENU
-
-
-@require_access
-async def show_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    tg_id = user.id if user else None
-
-    if tg_id is None:
-        await update.message.reply_text(
-            "Не смог получить твой TG ID 🤔",
-            reply_markup=main_keyboard(),
-        )
-        return MENU
-
-    total_swaps = get_swap_history_count(tg_id)
-    recent = list_recent_swaps(tg_id, limit=5)
-
-    msg_lines = [
-        "📂 Кабинет",
-        f"Всего успешных подмен: <b>{total_swaps}</b>",
-    ]
-
-    keyboard: List[List[InlineKeyboardButton]] = []
-    if recent:
-        msg_lines.append("\nПоследние 5 подмен:")
-        for item in recent:
-            label_date = item.get("created_at") or f"Подмена #{item.get('id')}"
-            label = f"{label_date} • ✅ {item.get('success_count') or 0}"
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        label,
-                        callback_data=f"cabinet:item:{item['id']}",
-                    )
-                ]
-            )
-
-    keyboard.append([InlineKeyboardButton("Выгрузить все смены", callback_data="cabinet:export")])
-
-    await update.message.reply_text(
-        "\n".join(msg_lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return MENU
-
-
-@require_access
-async def cabinet_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await delete_callback_message(query)
-
-    try:
-        _, _, swap_id_str = query.data.split(":", 2)
-        swap_id = int(swap_id_str)
-    except Exception:  # noqa: BLE001
-        await query.message.reply_text(
-            "Не понял, какую подмену открыть.", reply_markup=main_keyboard()
-        )
-        return MENU
-
-    user = update.effective_user
-    tg_id = user.id if user else None
-    if tg_id is None:
-        await query.message.reply_text(
-            "Не смог получить твой TG ID 🤔",
-            reply_markup=main_keyboard(),
-        )
-        return MENU
-
-    record = get_swap_by_id(tg_id, swap_id)
-    if not record:
-        await query.message.reply_text(
-            "Не нашёл эту подмену.", reply_markup=main_keyboard()
-        )
-        return MENU
-
-    token2 = record.get("token2")
-    session_id = record.get("session_id")
-    auth_text = token2 or session_id or "—"
-    auth_label = "token2" if token2 else "session_id"
-
-    message = (
-        f"💰 Стоимость: <b>{html.escape(str(record.get('price') or '—'))}</b>\n"
-        f"🏷️ Тариф: <b>{html.escape(str(record.get('tariff') or '—'))}</b>\n"
-        f"🔗 Ссылка: <code>{html.escape(str(record.get('trip_link') or '—'))}</code>\n"
-        f"✅ Успешных смен: <b>{html.escape(str(record.get('success_count') or 0))}</b>\n"
-        f"🔑 {auth_label}: <code>{html.escape(str(auth_text))}</code>"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Выгрузить все смены", callback_data="cabinet:export")]]
-    )
-
-    await query.message.reply_text(
-        message, parse_mode="HTML", reply_markup=keyboard
     )
     return MENU
 
@@ -5059,7 +4957,6 @@ def build_application() -> "Application":
                 CallbackQueryHandler(trip_delete_callback, pattern="^tripdelete:"),
                 CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
                 CallbackQueryHandler(info_actions_callback, pattern="^info:"),
-                CallbackQueryHandler(cabinet_item_callback, pattern="^cabinet:item:"),
                 CallbackQueryHandler(cabinet_export_callback, pattern="^cabinet:export"),
                 CallbackQueryHandler(start_choice_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
