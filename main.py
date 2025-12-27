@@ -76,7 +76,8 @@ PROXY_FILE: Final = Path(os.getenv("PROXY_FILE_PATH") or (BASE_DIR / "proxy.txt"
     ASK_ORDER_RAW,
     ASK_CONFIRM,
     ASK_TOKEN2_ID,
-) = range(27)
+    ASK_ADMIN_BALANCE_DELTA,
+) = range(28)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -98,7 +99,10 @@ _proxy_lock = threading.Lock()
 def is_user_allowed(user) -> bool:
     if not user:
         return False
-    return user.id in ALLOWED_USER_IDS
+    allowed = set(ALLOWED_USER_IDS)
+    if ADMIN_TG_ID:
+        allowed.add(ADMIN_TG_ID)
+    return user.id in allowed
 
 
 async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -539,10 +543,16 @@ def init_db():
             trip_link TEXT,
             tariff TEXT,
             price TEXT,
+            success_count INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
+
+    try:
+        cur.execute("ALTER TABLE swap_history ADD COLUMN success_count INTEGER DEFAULT 1;")
+    except sqlite3.OperationalError:
+        pass  # уже есть
 
     cur.execute(
         """
@@ -559,6 +569,29 @@ def init_db():
         cur.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 1;")
     except sqlite3.OperationalError:
         pass
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_balances (
+            tg_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS balance_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER NOT NULL,
+            delta REAL NOT NULL,
+            reason TEXT,
+            actor_tg_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -652,6 +685,123 @@ def is_user_verified(tg_id: int) -> bool:
     row = cur.fetchone()
     conn.close()
     return bool(row and row[0])
+
+
+def ensure_user_balance(tg_id: int) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_balances (tg_id, balance)
+        VALUES (?, 0)
+        ON CONFLICT(tg_id) DO NOTHING;
+        """,
+        (tg_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_balance(tg_id: int) -> float:
+    ensure_user_balance(tg_id)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT balance FROM user_balances WHERE tg_id = ? LIMIT 1;", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0] is not None:
+        return float(row[0])
+    return 0.0
+
+
+def change_user_balance(
+    tg_id: int,
+    delta: float,
+    *,
+    reason: str,
+    actor_tg_id: Optional[int] = None,
+) -> float:
+    ensure_user_balance(tg_id)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE user_balances
+        SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP
+        WHERE tg_id = ?;
+        """,
+        (delta, tg_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO balance_events (tg_id, delta, reason, actor_tg_id)
+        VALUES (?, ?, ?, ?);
+        """,
+        (tg_id, delta, reason, actor_tg_id),
+    )
+    conn.commit()
+    cur.execute("SELECT balance FROM user_balances WHERE tg_id = ? LIMIT 1;", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0] is not None:
+        return float(row[0])
+    return 0.0
+
+
+def list_user_balances(limit: int = 20) -> List[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT tg_id, balance, updated_at
+        FROM user_balances
+        ORDER BY balance DESC, updated_at DESC
+        LIMIT ?;
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {"tg_id": row[0], "balance": row[1], "updated_at": row[2]} for row in rows
+    ]
+
+
+def get_balance_stats() -> Tuple[int, float]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM user_balances;")
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return int(row[0] or 0), float(row[1] or 0)
+    return 0, 0.0
+
+
+def get_total_successful_swaps() -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(success_count), 0) FROM swap_history;")
+    (count,) = cur.fetchone()
+    conn.close()
+    return int(count or 0)
+
+
+def list_all_user_ids() -> List[int]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT tg_id FROM (
+            SELECT tg_id FROM user_balances
+            UNION
+            SELECT tg_id FROM swap_history
+        ) ORDER BY tg_id ASC;
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 
 def get_request_count_for_user(tg_id: int) -> int:
@@ -812,7 +962,7 @@ def delete_trip_template(trip_id: int, tg_id: int) -> None:
     conn.close()
 
 
-def log_swap_history(tg_id: int, details: dict) -> None:
+def log_swap_history(tg_id: int, details: dict, *, success_count: int = 1) -> None:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -826,9 +976,10 @@ def log_swap_history(tg_id: int, details: dict) -> None:
             orderid,
             trip_link,
             tariff,
-            price
+            price,
+            success_count
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             tg_id,
@@ -840,6 +991,7 @@ def log_swap_history(tg_id: int, details: dict) -> None:
             details.get("trip_link"),
             details.get("tariff"),
             details.get("price"),
+            success_count,
         ),
     )
     conn.commit()
@@ -849,7 +1001,10 @@ def log_swap_history(tg_id: int, details: dict) -> None:
 def get_swap_history_count(tg_id: int) -> int:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM swap_history WHERE tg_id = ?;", (tg_id,))
+    cur.execute(
+        "SELECT COALESCE(SUM(success_count), 0) FROM swap_history WHERE tg_id = ?;",
+        (tg_id,),
+    )
     (count,) = cur.fetchone()
     conn.close()
     return count or 0
@@ -860,7 +1015,7 @@ def list_recent_swaps(tg_id: int, limit: int = 5) -> List[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, created_at
+        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, success_count, created_at
         FROM swap_history
         WHERE tg_id = ?
         ORDER BY id DESC
@@ -880,6 +1035,7 @@ def list_recent_swaps(tg_id: int, limit: int = 5) -> List[dict]:
         "orderid",
         "card",
         "trip_id",
+        "success_count",
         "created_at",
     ]
     return [dict(zip(keys, row)) for row in rows]
@@ -890,7 +1046,7 @@ def get_swap_by_id(tg_id: int, swap_id: int) -> Optional[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, created_at
+        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, success_count, created_at
         FROM swap_history
         WHERE tg_id = ? AND id = ?
         LIMIT 1;
@@ -911,6 +1067,7 @@ def get_swap_by_id(tg_id: int, swap_id: int) -> Optional[dict]:
         "orderid",
         "card",
         "trip_id",
+        "success_count",
         "created_at",
     ]
     return dict(zip(keys, row))
@@ -921,7 +1078,7 @@ def export_swaps_to_file(tg_id: int) -> Optional[str]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, created_at
+        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, success_count, created_at
         FROM swap_history
         WHERE tg_id = ?
         ORDER BY id DESC;
@@ -937,9 +1094,11 @@ def export_swaps_to_file(tg_id: int) -> Optional[str]:
     fd, path = tempfile.mkstemp(suffix=".txt", prefix=f"swaps_{tg_id}_")
     os.close(fd)
 
+    total_success = sum((row[9] or 0) for row in rows)
+
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"TG ID: {tg_id}\n")
-        f.write(f"Всего подмен: {len(rows)}\n")
+        f.write(f"Всего успешных подмен: {total_success}\n")
         f.write("=" * 50 + "\n\n")
         for row in rows:
             (
@@ -952,10 +1111,12 @@ def export_swaps_to_file(tg_id: int) -> Optional[str]:
                 orderid,
                 card,
                 trip_id,
+                success_count,
                 created_at,
             ) = row
             f.write(f"Запись #{swap_id}\n")
             f.write(f"Время: {created_at}\n")
+            f.write(f"Успешных смен оплат: {success_count or 0}\n")
             f.write(f"Цена: {price or '—'}\n")
             f.write(f"Тариф: {tariff or '—'}\n")
             f.write(f"Ссылка: {trip_link or '—'}\n")
@@ -967,6 +1128,90 @@ def export_swaps_to_file(tg_id: int) -> Optional[str]:
             f.write("-" * 40 + "\n\n")
 
     return path
+
+
+def format_balance(balance: float) -> str:
+    return f"{balance:.2f}"
+
+
+def is_admin_user(user) -> bool:
+    if not user or ADMIN_TG_ID is None:
+        return False
+    return user.id == ADMIN_TG_ID
+
+
+async def ensure_trip_info_for_success(
+    tg_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    token2 = context.user_data.get("token")
+    orderid = context.user_data.get("orderid")
+    trip_id = context.user_data.get("id")
+    if not (token2 and orderid and trip_id):
+        return
+
+    if (
+        context.user_data.get("tariff")
+        and context.user_data.get("price")
+        and context.user_data.get("trip_link")
+    ):
+        return
+
+    try:
+        tariff, price, link, _ = await fetch_taxiontheway_info(token2, orderid, trip_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось обновить данные поездки перед логом: %s", e)
+        return
+
+    if tariff:
+        context.user_data["tariff"] = tariff
+    if price:
+        context.user_data["price"] = price
+    if link:
+        context.user_data["trip_link"] = link
+
+    _update_trip_fields(
+        context,
+        tg_id,
+        {
+            "tariff": tariff or "",
+            "price": price or "",
+            "trip_link": link or "",
+        },
+    )
+
+
+async def register_successful_change(
+    tg_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    session_id: str,
+    success_count: int,
+) -> Tuple[float, float]:
+    if success_count <= 0:
+        return get_user_balance(tg_id), 0.0
+
+    await ensure_trip_info_for_success(tg_id, context)
+
+    details = {
+        "token2": context.user_data.get("token"),
+        "session_id": session_id,
+        "trip_id": context.user_data.get("id"),
+        "card": context.user_data.get("card"),
+        "orderid": context.user_data.get("orderid"),
+        "trip_link": context.user_data.get("trip_link"),
+        "tariff": context.user_data.get("tariff"),
+        "price": context.user_data.get("price"),
+    }
+
+    log_swap_history(tg_id, details, success_count=success_count)
+    delta = success_count * 0.3
+    new_balance = change_user_balance(
+        tg_id,
+        delta,
+        reason=f"Успешная смена оплаты ×{success_count}",
+        actor_tg_id=tg_id,
+    )
+    return new_balance, delta
 
 
 def fetch_mike_orders() -> List[dict]:
@@ -1830,14 +2075,22 @@ async def do_single_request_and_log(
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["Профиль"],
+            ["🎄💳 Поменять оплату", "🎄👤 Профиль"],
+            ["🎄📜 Логи", "🎄🚂 Загрузить поездки"],
+            ["🛠️ Админка"],
         ],
         resize_keyboard=True,
     )
 
 
 def actions_keyboard() -> ReplyKeyboardMarkup:
-    return main_keyboard()
+    return ReplyKeyboardMarkup(
+        [
+            ["🎄🎯 Одиночная смена", "🎄🚀 Запустить потоки"],
+            ["🎄🛑 Остановить потоки", "🎄🔙 Назад"],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def _collect_progress_snapshot(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int, str, dict]:
@@ -1923,7 +2176,13 @@ async def restart_bot(context: ContextTypes.DEFAULT_TYPE):
 
 
 def logs_keyboard() -> ReplyKeyboardMarkup:
-    return main_keyboard()
+    return ReplyKeyboardMarkup(
+        [
+            ["🎄📖 Посмотреть логи", "🎄🕒 Логи последней сессии"],
+            ["🎄🔙 Назад"],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def device_choice_keyboard() -> InlineKeyboardMarkup:
@@ -2989,20 +3248,6 @@ async def collect_trip_info(
         },
     )
 
-    log_swap_history(
-        tg_id,
-        {
-            "token2": token2,
-            "session_id": session_cookie,
-            "trip_id": trip_id,
-            "card": context.user_data.get("card"),
-            "orderid": orderid,
-            "trip_link": link,
-            "tariff": tariff,
-            "price": price,
-        },
-    )
-
     return tariff, price, link, ""
 
 
@@ -3380,7 +3625,7 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Все параметры сохранены ✅\n\n"
-        "Теперь доступна кнопка «Профиль» — там статистика и история смен оплат.",
+        "Теперь доступна кнопка «🎄👤 Профиль» — там статистика и история смен оплат.",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -3437,6 +3682,9 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in {"🎄👤 Профиль", "Профиль"}:
         return await show_profile(update, context)
 
+    if text in {"🛠️ Админка", "Админка", "/admin"}:
+        return await show_admin_panel(update, context)
+
     if text == "Кабинет":
         return await show_cabinet(update, context)
 
@@ -3478,6 +3726,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_requests = get_request_count_for_user(tg_id)
     total_swaps = get_swap_history_count(tg_id)
+    balance = get_user_balance(tg_id)
     recent_swaps = list_recent_swaps(tg_id, limit=5)
     last_session_id = context.user_data.get("last_session_id")
     proxy_state = proxy_state_text()
@@ -3487,7 +3736,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
         f"TG ID: <code>{html.escape(str(tg_id))}</code>",
         f"Всего отправлено запросов: <b>{total_requests}</b>",
-        f"Всего смен оплат: <b>{total_swaps}</b>",
+        f"Всего успешных смен оплат: <b>{total_swaps}</b>",
+        f"💰 Баланс: <b>{format_balance(balance)}</b>",
         f"Прокси: {proxy_state}",
     ]
 
@@ -3502,6 +3752,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     f"\nЗапись #{html.escape(str(item.get('id', '—')))}",
                     f"Время: {html.escape(str(item.get('created_at') or '—'))}",
+                    f"Успешных смен оплат: {html.escape(str(item.get('success_count') or 0))}",
                     f"Цена: {html.escape(str(item.get('price') or '—'))}",
                     f"Тариф: {html.escape(str(item.get('tariff') or '—'))}",
                     f"Ссылка: {html.escape(str(item.get('trip_link') or '—'))}",
@@ -3530,6 +3781,442 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MENU
 
 
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("👥 Пользователи", callback_data="admin:users"),
+                InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Обновить", callback_data="admin:panel"),
+                InlineKeyboardButton("❌ Закрыть", callback_data="admin:close"),
+            ],
+        ]
+    )
+
+
+def admin_users_keyboard(users: List[dict]) -> InlineKeyboardMarkup:
+    buttons: List[List[InlineKeyboardButton]] = []
+    for item in users:
+        label = f"👤 {item['tg_id']} • 💰 {format_balance(item['balance'])}"
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"admin:user:{item['tg_id']}")]
+        )
+
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:panel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def admin_user_actions_keyboard(tg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Добавить баланс", callback_data=f"admin:add:{tg_id}"
+                ),
+                InlineKeyboardButton(
+                    "➖ Убавить баланс", callback_data=f"admin:sub:{tg_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📜 Смены оплат", callback_data=f"admin:swaps:{tg_id}"
+                ),
+                InlineKeyboardButton("⬅️ Назад", callback_data="admin:users"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Обновить", callback_data=f"admin:user:{tg_id}"),
+                InlineKeyboardButton("❌ Закрыть", callback_data="admin:close"),
+            ],
+        ]
+    )
+
+
+@require_access
+async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin_user(user):
+        await safe_reply(
+            update,
+            context,
+            "🚫 Админка доступна только администратору.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    total_users, total_balance = get_balance_stats()
+    total_swaps = get_total_successful_swaps()
+
+    msg = (
+        "🛠️ Админ-панель\n\n"
+        f"👥 Пользователей с балансом: <b>{total_users}</b>\n"
+        f"💰 Общий баланс: <b>{format_balance(total_balance)}</b>\n"
+        f"✅ Всего успешных смен оплат: <b>{total_swaps}</b>\n\n"
+        "Выбери действие ниже 👇"
+    )
+
+    await safe_reply(
+        update,
+        context,
+        msg,
+        parse_mode="HTML",
+        reply_markup=admin_panel_keyboard(),
+    )
+    return MENU
+
+
+async def show_admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await delete_callback_message(query)
+
+    user_ids = list_all_user_ids()
+    if not user_ids:
+        await safe_reply(
+            update,
+            context,
+            "Пока нет пользователей для отображения 🤷",
+            reply_markup=admin_panel_keyboard(),
+        )
+        return MENU
+
+    users: List[dict] = []
+    for tg_id in user_ids[:20]:
+        users.append({"tg_id": tg_id, "balance": get_user_balance(tg_id)})
+
+    await safe_reply(
+        update,
+        context,
+        "👥 Пользователи (топ-20):",
+        reply_markup=admin_users_keyboard(users),
+    )
+    return MENU
+
+
+async def show_admin_user_detail(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, target_id: int
+):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await delete_callback_message(query)
+
+    total_swaps = get_swap_history_count(target_id)
+    balance = get_user_balance(target_id)
+    total_requests = get_request_count_for_user(target_id)
+    recent_swaps = list_recent_swaps(target_id, limit=5)
+
+    msg_lines = [
+        f"👤 Пользователь: <code>{html.escape(str(target_id))}</code>",
+        f"💰 Баланс: <b>{format_balance(balance)}</b>",
+        f"✅ Успешных смен оплат: <b>{total_swaps}</b>",
+        f"📨 Всего запросов: <b>{total_requests}</b>",
+    ]
+
+    if recent_swaps:
+        msg_lines.append("")
+        msg_lines.append("Последние 5 смен оплат:")
+        for item in recent_swaps:
+            created_at = html.escape(str(item.get("created_at") or "—"))
+            msg_lines.append(
+                f"• #{item.get('id')} • ✅ {item.get('success_count') or 0} • {created_at}"
+            )
+    else:
+        msg_lines.append("")
+        msg_lines.append("Смен оплат пока нет.")
+
+    await safe_reply(
+        update,
+        context,
+        "\n".join(msg_lines),
+        parse_mode="HTML",
+        reply_markup=admin_user_actions_keyboard(target_id),
+    )
+    return MENU
+
+
+async def show_admin_user_swaps(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, target_id: int
+):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await delete_callback_message(query)
+
+    recent_swaps = list_recent_swaps(target_id, limit=10)
+    if not recent_swaps:
+        await safe_reply(
+            update,
+            context,
+            "У пользователя пока нет смен оплат 🙅",
+            reply_markup=admin_user_actions_keyboard(target_id),
+        )
+        return MENU
+
+    msg_lines = [f"📜 Смены оплат пользователя <code>{target_id}</code>:"]
+    for item in recent_swaps:
+        created_at = html.escape(str(item.get("created_at") or "—"))
+        success_count = html.escape(str(item.get("success_count") or 0))
+        price = html.escape(str(item.get("price") or "—"))
+        tariff = html.escape(str(item.get("tariff") or "—"))
+        trip_link = html.escape(str(item.get("trip_link") or "—"))
+        orderid = html.escape(str(item.get("orderid") or "—"))
+        card = html.escape(str(item.get("card") or "—"))
+        trip_id = html.escape(str(item.get("trip_id") or "—"))
+        msg_lines.extend(
+            [
+                "",
+                f"Запись #{item.get('id')}",
+                f"Время: {created_at}",
+                f"Успешных смен оплат: {success_count}",
+                f"Цена: {price}",
+                f"Тариф: {tariff}",
+                f"Ссылка: {trip_link}",
+                f"orderid: {orderid}",
+                f"card-x: {card}",
+                f"ID: {trip_id}",
+            ]
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📤 Выгрузить все смены", callback_data=f"admin:export:{target_id}"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:user:{target_id}")],
+        ]
+    )
+
+    await safe_reply(
+        update,
+        context,
+        "\n".join(msg_lines),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    return MENU
+
+
+async def admin_balance_adjust_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    target_id: int,
+    action: str,
+):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await delete_callback_message(query)
+
+    context.user_data["admin_target_id"] = target_id
+    context.user_data["admin_balance_action"] = action
+
+    prompt_action = "добавить" if action == "add" else "убавить"
+    await safe_reply(
+        update,
+        context,
+        f"💸 Сколько {prompt_action} баланса пользователю <code>{target_id}</code>?\n"
+        "Введи число (например 1.5):",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ASK_ADMIN_BALANCE_DELTA
+
+
+async def admin_balance_delta_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin_user(user):
+        await update.message.reply_text(
+            "🚫 Админка доступна только администратору.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        amount = float(text)
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Не понял сумму. Введи число, например 1.5.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_ADMIN_BALANCE_DELTA
+
+    if amount <= 0:
+        await update.message.reply_text(
+            "⚠️ Сумма должна быть больше нуля.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_ADMIN_BALANCE_DELTA
+
+    target_id = context.user_data.get("admin_target_id")
+    action = context.user_data.get("admin_balance_action")
+    if not target_id or action not in {"add", "sub"}:
+        await update.message.reply_text(
+            "Не удалось определить пользователя для изменения баланса.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    delta = amount if action == "add" else -amount
+    new_balance = change_user_balance(
+        int(target_id),
+        delta,
+        reason=f"Админ: {'пополнение' if delta > 0 else 'списание'}",
+        actor_tg_id=update.effective_user.id if update.effective_user else None,
+    )
+
+    context.user_data.pop("admin_target_id", None)
+    context.user_data.pop("admin_balance_action", None)
+
+    await update.message.reply_text(
+        f"✅ Баланс обновлён!\n"
+        f"Изменение: {format_balance(delta)}\n"
+        f"Новый баланс: {format_balance(new_balance)}",
+        reply_markup=main_keyboard(),
+    )
+
+    await show_admin_user_detail(update, context, target_id=int(target_id))
+    return MENU
+
+
+async def admin_export_swaps_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, target_id: int
+):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await delete_callback_message(query)
+
+    path = export_swaps_to_file(target_id)
+    if path is None:
+        await safe_reply(
+            update,
+            context,
+            "Пока нет сохранённых смен для выгрузки.",
+            reply_markup=admin_user_actions_keyboard(target_id),
+        )
+        return MENU
+
+    try:
+        with open(path, "rb") as f:
+            await safe_reply(
+                update,
+                context,
+                "📤 Отправляю выгрузку…",
+                reply_markup=admin_user_actions_keyboard(target_id),
+            )
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f, filename=f"swaps_{target_id}.txt"),
+                caption=f"Выгрузка смен оплат пользователя {target_id}",
+            )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    return MENU
+
+
+async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return MENU
+
+    user = update.effective_user
+    if not is_admin_user(user):
+        await query.answer()
+        await query.message.reply_text(
+            "🚫 Админка доступна только администратору.",
+            reply_markup=main_keyboard(),
+        )
+        return MENU
+
+    data = query.data or ""
+    if data == "admin:panel":
+        return await show_admin_panel(update, context)
+    if data == "admin:users":
+        return await show_admin_users(update, context)
+    if data == "admin:stats":
+        return await show_admin_panel(update, context)
+    if data == "admin:close":
+        await query.answer()
+        await delete_callback_message(query)
+        await query.message.reply_text(
+            "Админка закрыта ✅", reply_markup=main_keyboard()
+        )
+        return MENU
+    if data.startswith("admin:user:"):
+        try:
+            target_id = int(data.split(":", 2)[2])
+        except ValueError:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать ID пользователя.", reply_markup=main_keyboard()
+            )
+            return MENU
+        return await show_admin_user_detail(update, context, target_id=target_id)
+    if data.startswith("admin:swaps:"):
+        try:
+            target_id = int(data.split(":", 2)[2])
+        except ValueError:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать ID пользователя.", reply_markup=main_keyboard()
+            )
+            return MENU
+        return await show_admin_user_swaps(update, context, target_id=target_id)
+    if data.startswith("admin:add:"):
+        try:
+            target_id = int(data.split(":", 2)[2])
+        except ValueError:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать ID пользователя.", reply_markup=main_keyboard()
+            )
+            return MENU
+        return await admin_balance_adjust_callback(
+            update, context, target_id=target_id, action="add"
+        )
+    if data.startswith("admin:sub:"):
+        try:
+            target_id = int(data.split(":", 2)[2])
+        except ValueError:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать ID пользователя.", reply_markup=main_keyboard()
+            )
+            return MENU
+        return await admin_balance_adjust_callback(
+            update, context, target_id=target_id, action="sub"
+        )
+    if data.startswith("admin:export:"):
+        try:
+            target_id = int(data.split(":", 2)[2])
+        except ValueError:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать ID пользователя.", reply_markup=main_keyboard()
+            )
+            return MENU
+        return await admin_export_swaps_callback(
+            update, context, target_id=target_id
+        )
+
+    await query.answer()
+    await query.message.reply_text(
+        "Не понял команду админки 🤔", reply_markup=main_keyboard()
+    )
+    return MENU
+
+
 @require_access
 async def show_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -3547,17 +4234,15 @@ async def show_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg_lines = [
         "📂 Кабинет",
-        f"Всего подмен: <b>{total_swaps}</b>",
+        f"Всего успешных подмен: <b>{total_swaps}</b>",
     ]
 
     keyboard: List[List[InlineKeyboardButton]] = []
     if recent:
         msg_lines.append("\nПоследние 5 подмен:")
         for item in recent:
-            label = (
-                item.get("created_at")
-                or f"Подмена #{item.get('id')}"
-            )
+            label_date = item.get("created_at") or f"Подмена #{item.get('id')}"
+            label = f"{label_date} • ✅ {item.get('success_count') or 0}"
             keyboard.append(
                 [
                     InlineKeyboardButton(
@@ -3617,6 +4302,7 @@ async def cabinet_item_callback(update: Update, context: ContextTypes.DEFAULT_TY
         f"💰 Стоимость: <b>{html.escape(str(record.get('price') or '—'))}</b>\n"
         f"🏷️ Тариф: <b>{html.escape(str(record.get('tariff') or '—'))}</b>\n"
         f"🔗 Ссылка: <code>{html.escape(str(record.get('trip_link') or '—'))}</code>\n"
+        f"✅ Успешных смен: <b>{html.escape(str(record.get('success_count') or 0))}</b>\n"
         f"🔑 {auth_label}: <code>{html.escape(str(auth_text))}</code>"
     )
 
@@ -4104,13 +4790,25 @@ async def change_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     body_text = html.escape(sliced_response)
 
+    balance_note = ""
+    if ok and status_code is not None and 200 <= status_code < 300:
+        new_balance, delta = await register_successful_change(
+            tg_id,
+            context,
+            session_id=session_id,
+            success_count=1,
+        )
+        balance_note = (
+            f"\n\n💰 Баланс +{format_balance(delta)} → {format_balance(new_balance)}"
+        )
+
     if ok:
         msg = (
             f"✅ Запрос отправлен.\n"
             f"ID сессии: <code>{session_id}</code>\n"
             f"Прокси: {proxy_state}\n\n"
             f"Статус: {status_code}\n"
-            f"Тело ответа:\n<pre>{body_text}</pre>"
+            f"Тело ответа:\n<pre>{body_text}</pre>{balance_note}"
         )
     else:
         msg = (
@@ -4268,6 +4966,18 @@ async def bulk_change_payment(
 
     failed = completed - success
 
+    balance_note = ""
+    if success > 0:
+        new_balance, delta = await register_successful_change(
+            tg_id,
+            context,
+            session_id=session_id,
+            success_count=success,
+        )
+        balance_note = (
+            f"\n💰 Баланс +{format_balance(delta)} → {format_balance(new_balance)}"
+        )
+
     await safe_reply(
         update,
         context,
@@ -4276,7 +4986,8 @@ async def bulk_change_payment(
         f"Неуспешных запросов: {failed}\n"
         f"Всего попыток: {completed} из запланированных {total_requests}\n"
         f"ID сессии: <code>{session_id}</code>\n"
-        f"Прокси: {proxy_state}",
+        f"Прокси: {proxy_state}"
+        f"{balance_note}",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -4296,6 +5007,7 @@ def build_application() -> "Application":
     app = ApplicationBuilder().bot(bot).build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("request", request_restart))
+    app.add_handler(CommandHandler("admin", show_admin_panel))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -4334,6 +5046,7 @@ def build_application() -> "Application":
                 CallbackQueryHandler(confirm_callback, pattern="^confirm:")
             ],
             MENU: [
+                CallbackQueryHandler(admin_callback_router, pattern="^admin:"),
                 CallbackQueryHandler(tripfield_callback, pattern="^tripfield:"),
                 CallbackQueryHandler(trip_save_callback, pattern="^tripsave:"),
                 CallbackQueryHandler(trip_clear_callback, pattern="^tripclear:"),
@@ -4393,6 +5106,9 @@ def build_application() -> "Application":
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, bulk_schedule_delay_input
                 ),
+            ],
+            ASK_ADMIN_BALANCE_DELTA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_balance_delta_handler)
             ],
         },
         fallbacks=[
