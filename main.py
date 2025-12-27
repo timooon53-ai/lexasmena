@@ -40,7 +40,7 @@ from telegram.ext import (
 
 BOT_TOKEN: Final = cfg.TOKEN_BOTA
 ADMIN_TG_ID: Final = getattr(cfg, "ADMIN_TG_ID", None)
-ALLOWED_USER_IDS: Final = {7515876699, 966094117, 7846689040, 8143695937}
+ALLOWED_USER_IDS: Final = {8134807830, 7515876699, 966094117}
 
 CHANGE_PAYMENT_URL: Final = "https://tc.mobile.yandex.net/3.0/changepayment"
 BASE_DIR: Final = Path(__file__).resolve().parent
@@ -68,7 +68,14 @@ PROXY_FILE: Final = Path(os.getenv("PROXY_FILE_PATH") or (BASE_DIR / "proxy.txt"
     ASK_TRIP_TEXT,
     ASK_ACCESS_TOKEN,
     ASK_SCHEDULE_DELAY,
-) = range(19)
+    ASK_DEVICE,
+    ASK_SESSION_ID,
+    ASK_TOKEN2,
+    ASK_ORDER_METHOD,
+    ASK_ORDER_LINK,
+    ASK_ORDER_RAW,
+    ASK_CONFIRM,
+) = range(26)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -84,18 +91,30 @@ _proxy_lock = threading.Lock()
 
 
 def is_user_allowed(user) -> bool:
-    return True
+    if not user:
+        return False
+    return user.id in ALLOWED_USER_IDS
 
 
 async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return True
+    user = update.effective_user
+    if is_user_allowed(user):
+        return True
+
+    await safe_reply(
+        update,
+        context,
+        "Доступ запрещён. Этот бот доступен только для разрешённых пользователей.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return False
 
 
 def require_access(handler):
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if not await ensure_user_allowed(update, context):
-            return ASK_ACCESS_TOKEN
+            return ConversationHandler.END
         return await handler(update, context, *args, **kwargs)
 
     return wrapper
@@ -1381,14 +1400,8 @@ async def do_single_request_and_log(
     )
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["🎄💳 Поменять оплату", "🎄👤 Профиль"],
-            ["🎄🚂 Загрузить поездки", "🎄📜 Логи"],
-        ],
-        resize_keyboard=True,
-    )
+def main_keyboard() -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove()
 
 
 def actions_keyboard() -> ReplyKeyboardMarkup:
@@ -1496,6 +1509,33 @@ def logs_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def device_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Андроид", callback_data="device:android")],
+            [InlineKeyboardButton("Айфон", callback_data="device:iphone")],
+        ]
+    )
+
+
+def order_method_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Ссылкой", callback_data="order:link")],
+            [InlineKeyboardButton("Order", callback_data="order:raw")],
+        ]
+    )
+
+
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Поменять оплату", callback_data="confirm:change")],
+            [InlineKeyboardButton("Удалить", callback_data="confirm:delete")],
+        ]
+    )
+
+
 def _field_icon(value: Optional[str]) -> str:
     return "✅" if value else "⬜"
 
@@ -1513,6 +1553,14 @@ def ensure_active_trip_record(tg_id: int, context: ContextTypes.DEFAULT_TYPE) ->
 
     set_trip_form_mode(context, trip_id, "create")
 
+    return record
+
+
+def create_active_trip(tg_id: int, context: ContextTypes.DEFAULT_TYPE) -> dict:
+    trip_id = create_trip_template(tg_id)
+    context.user_data["active_trip_id"] = trip_id
+    set_trip_form_mode(context, trip_id, "create")
+    record = get_trip_template(trip_id, tg_id) or {}
     return record
 
 
@@ -2359,17 +2407,278 @@ async def request_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_access
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("token", None)
+    context.user_data.pop("session_cookie", None)
+    context.user_data.pop("orderid", None)
+    context.user_data.pop("card", None)
+    context.user_data.pop("id", None)
+    context.user_data.pop("active_trip_id", None)
+    context.user_data.pop("trip_link", None)
+    context.user_data.pop("device", None)
+
     await safe_reply(
         update,
         context,
-        "🎄 Привет! 👋\n"
-        "🎄 Я бот для отправки запроса changepayment.\n\n"
-        "🎄 Нажми «🎄💳 Поменять оплату», там выбери «🎄🎯 Одиночная смена» или «🎄🚀 Запустить потоки».\n"
-        "🎄 Кнопка «🎄🚂 Загрузить поездки» — чтобы добавить или обновить поездки.\n\n"
-        f"🎄 Прокси: {proxy_state_text()}",
-        reply_markup=main_keyboard(),
+        "Привет! Выбери своё устройство 👇",
+        reply_markup=device_choice_keyboard(),
     )
-    return MENU
+    return ASK_DEVICE
+
+
+@require_access
+async def device_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await delete_callback_message(query)
+
+    choice = query.data.split(":", 1)[1] if ":" in query.data else ""
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.message.reply_text(
+            "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    create_active_trip(tg_id, context)
+    context.user_data["device"] = choice
+
+    if choice == "android":
+        await query.message.reply_text(
+            "Отправь session_id:", reply_markup=ReplyKeyboardRemove()
+        )
+        return ASK_SESSION_ID
+
+    if choice == "iphone":
+        await query.message.reply_text(
+            "Отправь token2:", reply_markup=ReplyKeyboardRemove()
+        )
+        return ASK_TOKEN2
+
+    await query.message.reply_text(
+        "Не понял выбор. Попробуй ещё раз.", reply_markup=device_choice_keyboard()
+    )
+    return ASK_DEVICE
+
+
+def _update_trip_fields(
+    context: ContextTypes.DEFAULT_TYPE, tg_id: int, field_values: dict
+) -> None:
+    trip_id = context.user_data.get("active_trip_id")
+    if not trip_id:
+        record = create_active_trip(tg_id, context)
+        trip_id = record.get("id")
+
+    for field, value in field_values.items():
+        if value:
+            update_trip_template_field(trip_id, tg_id, field, value)
+
+
+async def _show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    orderid = context.user_data.get("orderid")
+    card = context.user_data.get("card")
+    trip_id = context.user_data.get("id")
+    token2 = context.user_data.get("token")
+    session_cookie = context.user_data.get("session_cookie")
+
+    auth_text = token2 or session_cookie or "—"
+    auth_label = "token2" if token2 else "session_id"
+
+    message = (
+        "Проверь данные перед запуском:\n\n"
+        f"💳 card-x: <code>{html.escape(str(card or '—'))}</code>\n"
+        f"📄 orderid: <code>{html.escape(str(orderid or '—'))}</code>\n"
+        f"🔑 {auth_label}: <code>{html.escape(str(auth_text))}</code>\n"
+        f"🪪 ID: <code>{html.escape(str(trip_id or '—'))}</code>"
+    )
+
+    if update.callback_query:
+        chat = update.callback_query.message
+        await chat.reply_text(message, parse_mode="HTML", reply_markup=confirm_keyboard())
+    else:
+        await update.message.reply_text(message, parse_mode="HTML", reply_markup=confirm_keyboard())
+
+    return ASK_CONFIRM
+
+
+@require_access
+async def session_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session_id = update.message.text.strip()
+    context.user_data["session_cookie"] = session_id
+    context.user_data.pop("token", None)
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await update.message.reply_text(
+            "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    _update_trip_fields(context, tg_id, {"session_id": session_id})
+
+    try:
+        parsed = await fetch_session_details(session_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось распарсить данные по session_id: %s", e)
+        parsed = {}
+
+    card = parsed.get("card")
+    trip_id = parsed.get("trip_id")
+    context.user_data["card"] = card
+    context.user_data["id"] = trip_id
+
+    _update_trip_fields(context, tg_id, {"card": card, "trip_id": trip_id})
+
+    await update.message.reply_text(
+        "Как отправить order id?", reply_markup=order_method_keyboard()
+    )
+    return ASK_ORDER_METHOD
+
+
+@require_access
+async def token2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token2 = update.message.text.strip()
+    context.user_data["token"] = token2
+    context.user_data.pop("session_cookie", None)
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await update.message.reply_text(
+            "Не смог получить твой TG ID 🤔", reply_markup=main_keyboard()
+        )
+        return MENU
+
+    _update_trip_fields(context, tg_id, {"token2": token2})
+
+    try:
+        parsed = await fetch_trip_details_from_token(token2)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось распарсить данные по token2: %s", e)
+        parsed = {}
+
+    card = parsed.get("card")
+    trip_id = parsed.get("trip_id")
+    context.user_data["card"] = card
+    context.user_data["id"] = trip_id
+
+    _update_trip_fields(context, tg_id, {"card": card, "trip_id": trip_id})
+
+    await update.message.reply_text(
+        "Как отправить order id?", reply_markup=order_method_keyboard()
+    )
+    return ASK_ORDER_METHOD
+
+
+@require_access
+async def order_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await delete_callback_message(query)
+
+    choice = query.data.split(":", 1)[1] if ":" in query.data else ""
+    if choice == "link":
+        await query.message.reply_text(
+            "Отправь ссылку в формате:\n"
+            "https://m.taxi.yandex.ru/webview/history/item/taxi/"
+            "712049562a9d8b15adae9454a1289a19?helpType=Yandex&isIframeSupported=true&"
+            "phone=+79304520562&city=moscow&isFullscreen=true",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_ORDER_LINK
+
+    if choice == "raw":
+        await query.message.reply_text(
+            "Отправь order id:", reply_markup=ReplyKeyboardRemove()
+        )
+        return ASK_ORDER_RAW
+
+    await query.message.reply_text(
+        "Не понял выбор. Попробуй ещё раз.", reply_markup=order_method_keyboard()
+    )
+    return ASK_ORDER_METHOD
+
+
+@require_access
+async def order_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    link = update.message.text.strip()
+    match = re.search(r"/taxi/([^/?]+)", link)
+    if not match:
+        await update.message.reply_text(
+            "Не смог найти order id в ссылке. Проверь формат и пришли ещё раз.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_ORDER_LINK
+
+    orderid = match.group(1)
+    context.user_data["orderid"] = orderid
+    context.user_data["trip_link"] = link
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id:
+        _update_trip_fields(context, tg_id, {"orderid": orderid, "trip_link": link})
+
+    return await _show_confirmation(update, context)
+
+
+@require_access
+async def order_raw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    orderid = update.message.text.strip()
+    context.user_data["orderid"] = orderid
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id:
+        _update_trip_fields(context, tg_id, {"orderid": orderid})
+
+    return await _show_confirmation(update, context)
+
+
+@require_access
+async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await delete_callback_message(query)
+    choice = query.data.split(":", 1)[1] if ":" in query.data else ""
+
+    if choice == "delete":
+        user = update.effective_user
+        tg_id = user.id if user else None
+        trip_id = context.user_data.get("active_trip_id")
+        if tg_id and trip_id:
+            delete_trip_template(trip_id, tg_id)
+
+        context.user_data.pop("token", None)
+        context.user_data.pop("session_cookie", None)
+        context.user_data.pop("orderid", None)
+        context.user_data.pop("card", None)
+        context.user_data.pop("id", None)
+        context.user_data.pop("active_trip_id", None)
+        context.user_data.pop("trip_link", None)
+        context.user_data.pop("device", None)
+
+        await query.message.reply_text(
+            "Данные удалены. Возвращаю в главное меню.",
+            reply_markup=device_choice_keyboard(),
+        )
+        return ASK_DEVICE
+
+    if choice == "change":
+        context.user_data["threads"] = 300
+        context.user_data["pending_bulk"] = {"threads": 300, "total": 600}
+        await query.message.reply_text(
+            "Запускаю смену оплаты...",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await bulk_change_payment(update, context, 300, 600)
+        return MENU
+
+    await query.message.reply_text(
+        "Не понял выбор. Попробуй ещё раз.", reply_markup=confirm_keyboard()
+    )
+    return ASK_CONFIRM
 
 
 async def access_token_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3194,12 +3503,12 @@ async def bulk_change_payment(
     await safe_reply(
         update,
         context,
-        f"🎄 Массовая отправка завершена (или остановлена).\n"
+        f"✅ Оплата успешно изменена\n"
+        f"Успешных запросов: {success}\n"
+        f"Неуспешных запросов: {failed}\n"
+        f"Всего попыток: {completed} из запланированных {total_requests}\n"
         f"ID сессии: <code>{session_id}</code>\n"
-        f"Прокси: {proxy_state}\n"
-        f"Успешных логических запросов: {success}\n"
-        f"Неуспешных: {failed}\n"
-        f"Всего попыток: {completed} из запланированных {total_requests}",
+        f"Прокси: {proxy_state}",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -3232,6 +3541,27 @@ def build_application() -> "Application":
             ASK_ORDERID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_orderid)],
             ASK_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_card)],
             ASK_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_id)],
+            ASK_DEVICE: [
+                CallbackQueryHandler(device_choice_callback, pattern="^device:")
+            ],
+            ASK_SESSION_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, session_id_handler)
+            ],
+            ASK_TOKEN2: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, token2_handler)
+            ],
+            ASK_ORDER_METHOD: [
+                CallbackQueryHandler(order_method_callback, pattern="^order:")
+            ],
+            ASK_ORDER_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_link_handler)
+            ],
+            ASK_ORDER_RAW: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_raw_handler)
+            ],
+            ASK_CONFIRM: [
+                CallbackQueryHandler(confirm_callback, pattern="^confirm:")
+            ],
             MENU: [
                 CallbackQueryHandler(tripfield_callback, pattern="^tripfield:"),
                 CallbackQueryHandler(trip_save_callback, pattern="^tripsave:"),
