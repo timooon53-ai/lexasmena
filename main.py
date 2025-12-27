@@ -226,9 +226,12 @@ async def delete_callback_message(query):
     if message is None:
         return
     try:
-        await message.delete()
+        await message.edit_reply_markup(reply_markup=None)
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class ChangePaymentClient:
@@ -1134,6 +1137,22 @@ def format_balance(balance: float) -> str:
     return f"{balance:.2f}"
 
 
+def parse_price_value(raw_price: Optional[object]) -> Optional[float]:
+    if raw_price is None:
+        return None
+    if isinstance(raw_price, (int, float)):
+        return float(raw_price)
+    if isinstance(raw_price, str):
+        cleaned = raw_price.replace(",", ".")
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)", cleaned)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
 def is_admin_user(user) -> bool:
     if not user:
         return False
@@ -1192,6 +1211,11 @@ async def register_successful_change(
 
     await ensure_trip_info_for_success(tg_id, context)
 
+    price_value = parse_price_value(context.user_data.get("price"))
+    if price_value is None:
+        logger.warning("Не удалось распознать цену для начисления баланса: %s", context.user_data.get("price"))
+        price_value = 0.0
+
     details = {
         "token2": context.user_data.get("token"),
         "session_id": session_id,
@@ -1204,11 +1228,11 @@ async def register_successful_change(
     }
 
     log_swap_history(tg_id, details, success_count=success_count)
-    delta = success_count * 0.3
+    delta = price_value * 0.15 * success_count
     new_balance = change_user_balance(
         tg_id,
         delta,
-        reason=f"Успешная смена оплаты ×{success_count}",
+        reason=f"Начисление 15% от цены поездки ×{success_count}",
         actor_tg_id=tg_id,
     )
     return new_balance, delta
@@ -3748,7 +3772,9 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = user.id if user else None
 
     if tg_id is None:
-        await update.message.reply_text(
+        await safe_reply(
+            update,
+            context,
             "Не смог получить твой TG ID 🤔",
             reply_markup=main_keyboard(),
         )
@@ -3797,12 +3823,16 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_lines.append("")
         msg_lines.append("Смен оплат пока нет.")
 
-    await update.message.reply_text(
+    await safe_reply(
+        update,
+        context,
         "\n".join(msg_lines),
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
-    await update.message.reply_text(
+    await safe_reply(
+        update,
+        context,
         "Выгрузка смен оплат:",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("Выгрузить все смены оплат", callback_data="cabinet:export")]]
