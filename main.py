@@ -860,7 +860,7 @@ def list_recent_swaps(tg_id: int, limit: int = 5) -> List[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, tariff, price, trip_link, token2, session_id, created_at
+        SELECT id, tariff, price, trip_link, token2, session_id, orderid, card, trip_id, created_at
         FROM swap_history
         WHERE tg_id = ?
         ORDER BY id DESC
@@ -877,6 +877,9 @@ def list_recent_swaps(tg_id: int, limit: int = 5) -> List[dict]:
         "trip_link",
         "token2",
         "session_id",
+        "orderid",
+        "card",
+        "trip_id",
         "created_at",
     ]
     return [dict(zip(keys, row)) for row in rows]
@@ -1760,24 +1763,14 @@ async def do_single_request_and_log(
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["🎄💳 Поменять оплату"],
-            ["Профиль", "Кабинет"],
-            ["🎄📜 Логи", "🎄🚂 Загрузить поездки"],
+            ["Профиль"],
         ],
         resize_keyboard=True,
     )
 
 
 def actions_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["🎄🎯 Одиночная смена"],
-            ["🎄🚀 Запустить потоки"],
-            ["🎄🛑 Остановить потоки"],
-            ["🎄🔙 Назад"],
-        ],
-        resize_keyboard=True,
-    )
+    return main_keyboard()
 
 
 def _collect_progress_snapshot(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int, str, dict]:
@@ -1863,14 +1856,7 @@ async def restart_bot(context: ContextTypes.DEFAULT_TYPE):
 
 
 def logs_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            ["🎄📖 Посмотреть логи"],
-            ["🎄🕒 Логи последней сессии"],
-            ["🎄🔙 Назад"],
-        ],
-        resize_keyboard=True,
-    )
+    return main_keyboard()
 
 
 def device_choice_keyboard() -> InlineKeyboardMarkup:
@@ -3304,12 +3290,7 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Все параметры сохранены ✅\n\n"
-        "Теперь ты можешь:\n"
-        "• Через «🎄💳 Поменять оплату» → «🎄🎯 Одиночная смена» — один POST-запрос.\n"
-        "• Через «🎄💳 Поменять оплату» → «🎄🚀 Запустить потоки» — массовая отправка.\n"
-        "• «🎄👤 Профиль» — статистика.\n"
-        "• «🎄📜 Логи» — меню для выгрузки логов.\n"
-        "• «🎄🚂 Загрузить поездки» — добавление и редактирование поездок.",
+        "Теперь доступна кнопка «Профиль» — там статистика и история смен оплат.",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -3387,7 +3368,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await show_trip_loader(update, context)
 
     await update.message.reply_text(
-        "Не понял команду. Используй кнопки на клавиатуре.",
+        "Не понял команду. Используй кнопку «Профиль».",
         reply_markup=main_keyboard(),
     )
     return MENU
@@ -3406,25 +3387,51 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MENU
 
     total_requests = get_request_count_for_user(tg_id)
+    total_swaps = get_swap_history_count(tg_id)
+    recent_swaps = list_recent_swaps(tg_id, limit=5)
     last_session_id = context.user_data.get("last_session_id")
     proxy_state = proxy_state_text()
 
-    msg = (
-        f"🎄👤 Профиль\n\n"
-        f"TG ID: <code>{html.escape(str(tg_id))}</code>\n"
-        f"Всего отправлено запросов: <b>{total_requests}</b>\n"
-        f"Прокси: {proxy_state}\n"
-    )
+    msg_lines = [
+        "🎄👤 Профиль",
+        "",
+        f"TG ID: <code>{html.escape(str(tg_id))}</code>",
+        f"Всего отправлено запросов: <b>{total_requests}</b>",
+        f"Всего смен оплат: <b>{total_swaps}</b>",
+        f"Прокси: {proxy_state}",
+    ]
 
     if last_session_id:
-        msg += f"\nПоследний ID сессии: <code>{html.escape(str(last_session_id))}</code>\n"
+        msg_lines.append(f"Последний ID сессии: <code>{html.escape(str(last_session_id))}</code>")
 
-    msg += "\nКнопка «🎄🕒 Логи последней сессии» сразу скинет .txt по последней сессии."
+    if recent_swaps:
+        msg_lines.append("")
+        msg_lines.append("Последние 5 смен оплат:")
+        for item in recent_swaps:
+            msg_lines.extend(
+                [
+                    f"\nЗапись #{html.escape(str(item.get('id', '—')))}",
+                    f"Время: {html.escape(str(item.get('created_at') or '—'))}",
+                    f"Цена: {html.escape(str(item.get('price') or '—'))}",
+                    f"Тариф: {html.escape(str(item.get('tariff') or '—'))}",
+                    f"Ссылка: {html.escape(str(item.get('trip_link') or '—'))}",
+                    f"token2: {html.escape(str(item.get('token2') or '—'))}",
+                    f"session_id: {html.escape(str(item.get('session_id') or '—'))}",
+                    f"orderid: {html.escape(str(item.get('orderid') or '—'))}",
+                    f"card-x: {html.escape(str(item.get('card') or '—'))}",
+                    f"ID: {html.escape(str(item.get('trip_id') or '—'))}",
+                ]
+            )
+    else:
+        msg_lines.append("")
+        msg_lines.append("Смен оплат пока нет.")
 
     await update.message.reply_text(
-        msg,
+        "\n".join(msg_lines),
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Выгрузить все смены оплат", callback_data="cabinet:export")]]
+        ),
     )
     return MENU
 
