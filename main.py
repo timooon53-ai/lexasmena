@@ -113,7 +113,12 @@ async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE
     await safe_reply(
         update,
         context,
-        "Доступ запрещён. Этот бот доступен только для разрешённых пользователей.",
+        "Доступ запрещён. Можно арендовать доступ к боту:\n"
+        "• На час — 1000₽\n"
+        "• На сутки — 5000₽\n"
+        "• Навсегда — 15000₽\n\n"
+        "После оплаты — полный доступ к заказу, аккаунты для заказа и сопровождение всей поездки.\n"
+        "Оплата возможна через оператора — @TakeMaxist.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return False
@@ -1228,11 +1233,11 @@ async def register_successful_change(
     }
 
     log_swap_history(tg_id, details, success_count=success_count)
-    delta = price_value * 0.15 * success_count
+    delta = price_value * 0.15
     new_balance = change_user_balance(
         tg_id,
         delta,
-        reason=f"Начисление 15% от цены поездки ×{success_count}",
+        reason="Начисление 15% от цены поездки",
         actor_tg_id=tg_id,
     )
     return new_balance, delta
