@@ -5886,7 +5886,7 @@ def build_application() -> "Application":
             CommandHandler("start", start),  # <--- добавили
             CommandHandler("request", request_restart),
         ],
-        per_message=True,
+        per_message=False,
         allow_reentry=True,
     )
 
