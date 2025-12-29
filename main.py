@@ -3852,11 +3852,13 @@ async def start_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text(
             "Выбрал массовый запуск. Сначала введи параметры через «🎄💳 Поменять оплату»,"
             " а потом нажми «🎄🚀 Запустить потоки».",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(update.effective_user),
         )
         return MENU
 
-    await query.message.reply_text("Неизвестный выбор.", reply_markup=main_keyboard())
+    await query.message.reply_text(
+        "🤔 Неизвестный выбор.", reply_markup=main_keyboard(update.effective_user)
+    )
     return MENU
 
 
@@ -5817,7 +5819,7 @@ def build_application() -> "Application":
                 CallbackQueryHandler(
                     cabinet_get_account_callback, pattern="^cabinet:get_account"
                 ),
-                CallbackQueryHandler(start_choice_callback),
+                CallbackQueryHandler(start_choice_callback, pattern="^(single|bulk)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler),
             ],
             ASK_THREADS: [
@@ -5884,7 +5886,7 @@ def build_application() -> "Application":
             CommandHandler("start", start),  # <--- добавили
             CommandHandler("request", request_restart),
         ],
-        per_message=False,
+        per_message=True,
     )
 
     app.add_handler(conv)
