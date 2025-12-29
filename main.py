@@ -631,9 +631,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account TEXT NOT NULL,
             added_by INTEGER,
-            used_by INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            used_at TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
@@ -644,9 +642,19 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account TEXT NOT NULL,
             added_by INTEGER,
-            used_by INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            used_at TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER NOT NULL,
+            account TEXT NOT NULL,
+            source_kind TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
@@ -904,7 +912,7 @@ def add_accounts_to_table(kind: str, accounts: List[str], added_by: Optional[int
     return len(accounts)
 
 
-def fetch_next_account(kind: str) -> Optional[dict]:
+def pop_next_account(kind: str) -> Optional[str]:
     table = ACCOUNT_TABLES.get(kind)
     if not table:
         return None
@@ -914,31 +922,80 @@ def fetch_next_account(kind: str) -> Optional[dict]:
         f"""
         SELECT id, account
         FROM {table}
-        WHERE used_by IS NULL
         ORDER BY id ASC
         LIMIT 1;
         """
     )
     row = cur.fetchone()
-    conn.close()
     if not row:
+        conn.close()
         return None
-    return {"id": row[0], "account": row[1]}
+    account_id, account = row
+    cur.execute(f"DELETE FROM {table} WHERE id = ?;", (account_id,))
+    conn.commit()
+    conn.close()
+    return account
 
 
-def mark_account_used(kind: str, account_id: int, used_by: int) -> None:
-    table = ACCOUNT_TABLES.get(kind)
-    if not table:
-        return
+def add_user_account(tg_id: int, account: str, source_kind: str) -> None:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        f"""
-        UPDATE {table}
-        SET used_by = ?, used_at = CURRENT_TIMESTAMP
-        WHERE id = ?;
+        """
+        INSERT INTO user_accounts (tg_id, account, source_kind)
+        VALUES (?, ?, ?);
         """,
-        (used_by, account_id),
+        (tg_id, account, source_kind),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_user_accounts(tg_id: int) -> List[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, account, created_at
+        FROM user_accounts
+        WHERE tg_id = ?
+        ORDER BY id DESC;
+        """,
+        (tg_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": row[0], "account": row[1], "created_at": row[2]} for row in rows]
+
+
+def get_user_account(tg_id: int, account_id: int) -> Optional[str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT account
+        FROM user_accounts
+        WHERE tg_id = ? AND id = ?
+        LIMIT 1;
+        """,
+        (tg_id, account_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return row[0]
+
+
+def delete_user_account(tg_id: int, account_id: int) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        DELETE FROM user_accounts
+        WHERE tg_id = ? AND id = ?;
+        """,
+        (tg_id, account_id),
     )
     conn.commit()
     conn.close()
@@ -2281,20 +2338,25 @@ async def do_single_request_and_log(
     )
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def main_keyboard(user=None) -> InlineKeyboardMarkup:
+    is_admin = bool(user and is_admin_user(user))
+    rows = [
+        [InlineKeyboardButton("🎄💳 Поменять оплату", callback_data="main:change")],
         [
+            InlineKeyboardButton("🎄🎁 Получить аккаунт", callback_data="main:get_account"),
+            InlineKeyboardButton("🎄👤 Профиль", callback_data="main:profile"),
+        ],
+    ]
+    if is_admin:
+        rows.append(
             [
-                InlineKeyboardButton(
-                    "🎄💳 Поменять оплату", callback_data="main:change"
-                )
-            ],
-            [
-                InlineKeyboardButton("🎄👤 Профиль", callback_data="main:profile"),
+                InlineKeyboardButton("🎄🧾 Второй заказ", callback_data="main:second_order"),
                 InlineKeyboardButton("🛠️ Админка", callback_data="main:admin"),
-            ],
-        ]
-    )
+            ]
+        )
+    else:
+        rows.append([InlineKeyboardButton("🛠️ Админка", callback_data="main:admin")])
+    return InlineKeyboardMarkup(rows)
 
 
 def actions_keyboard() -> ReplyKeyboardMarkup:
@@ -3314,7 +3376,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         context,
         "Привет! Выбери действие 👇",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(update.effective_user),
     )
     return MENU
 
@@ -3849,10 +3911,10 @@ async def ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await delete_callback_message(query)
 
     action = query.data.split(":", 1)[1] if ":" in query.data else ""
     if action == "change":
+        await delete_callback_message(query)
         reset_user_trip_context(context)
         await query.message.reply_text(
             "Выбери своё устройство 👇",
@@ -3864,16 +3926,60 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await show_profile(update, context)
 
     if action == "admin":
+        await delete_callback_message(query)
         return await show_admin_panel(update, context)
 
     if action == "menu":
+        await delete_callback_message(query)
         await query.message.reply_text(
-            "Возвращаюсь в меню ↩️.", reply_markup=main_keyboard()
+            "↩️ Возвращаюсь в меню.", reply_markup=main_keyboard(update.effective_user)
         )
         return MENU
 
-    await query.message.reply_text(
-        "Не понял выбор 🤔", reply_markup=main_keyboard()
+    if action == "get_account":
+        account = pop_next_account("first")
+        if not account:
+            await query.edit_message_text(
+                "😕 Аккаунтов пока нет. Попробуй позже.",
+                reply_markup=main_keyboard(update.effective_user),
+            )
+            return MENU
+        user = update.effective_user
+        if user:
+            add_user_account(user.id, account, "first")
+        await query.edit_message_text(
+            f"🎁 Аккаунт выдан:\n<pre>{html.escape(account)}</pre>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    if action == "second_order":
+        user = update.effective_user
+        if not is_admin_user(user):
+            await query.edit_message_text(
+                "🚫 Эта кнопка доступна только администратору.",
+                reply_markup=main_keyboard(update.effective_user),
+            )
+            return MENU
+        account = pop_next_account("second")
+        if not account:
+            await query.edit_message_text(
+                "😕 Аккаунтов для второго заказа нет.",
+                reply_markup=main_keyboard(update.effective_user),
+            )
+            return MENU
+        if user:
+            add_user_account(user.id, account, "second")
+        await query.edit_message_text(
+            f"🎁 Аккаунт (второй заказ):\n<pre>{html.escape(account)}</pre>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    await query.edit_message_text(
+        "🤔 Не понял выбор.", reply_markup=main_keyboard(update.effective_user)
     )
     return MENU
 
@@ -3991,12 +4097,17 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 [
                     InlineKeyboardButton(
-                        "Получить аккаунт", callback_data="cabinet:get_account"
+                        "🎁 Получить аккаунт", callback_data="cabinet:get_account"
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        "Выгрузить все смены оплат", callback_data="cabinet:export"
+                        "📂 Мои аккаунты", callback_data="cabinet:accounts"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📤 Выгрузить все смены оплат", callback_data="cabinet:export"
                     )
                 ],
                 [InlineKeyboardButton("🔙 Назад", callback_data="main:menu")],
@@ -4791,33 +4902,266 @@ async def cabinet_export_callback(update: Update, context: ContextTypes.DEFAULT_
 async def cabinet_get_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await delete_callback_message(query)
 
     user = update.effective_user
     tg_id = user.id if user else None
     if tg_id is None:
-        await query.message.reply_text(
-            "Не смог получить твой TG ID 🤔",
-            reply_markup=main_keyboard(),
+        await query.edit_message_text(
+            "🤔 Не смог получить твой TG ID.",
+            reply_markup=main_keyboard(update.effective_user),
         )
         return MENU
 
-    total_swaps = get_swap_history_count(tg_id)
-    kind = "first" if total_swaps <= 0 else "second"
-    account_entry = fetch_next_account(kind)
-    if not account_entry:
-        await query.message.reply_text(
-            "Пока нет доступных аккаунтов. Попробуй позже.",
-            reply_markup=main_keyboard(),
+    account = pop_next_account("first")
+    if not account:
+        await query.edit_message_text(
+            "😕 Аккаунтов пока нет. Попробуй позже.",
+            reply_markup=main_keyboard(update.effective_user),
         )
         return MENU
 
-    mark_account_used(kind, account_entry["id"], tg_id)
-    await query.message.reply_text(
-        f"Твой аккаунт:\n{account_entry['account']}",
-        reply_markup=main_keyboard(),
+    add_user_account(tg_id, account, "first")
+    await query.edit_message_text(
+        f"🎁 Аккаунт выдан:\n<pre>{html.escape(account)}</pre>",
+        parse_mode="HTML",
+        reply_markup=main_keyboard(update.effective_user),
     )
     return MENU
+
+
+def export_user_accounts_to_file(tg_id: int) -> Optional[str]:
+    accounts = list_user_accounts(tg_id)
+    if not accounts:
+        return None
+    fd, path = tempfile.mkstemp(prefix=f"accounts_{tg_id}_", suffix=".txt")
+    os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
+        for item in accounts:
+            f.write(f"{item['account']}\n")
+    return path
+
+
+@require_access
+async def cabinet_accounts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.edit_message_text(
+            "🤔 Не смог получить твой TG ID.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    accounts = list_user_accounts(tg_id)
+    if not accounts:
+        await query.edit_message_text(
+            "📭 У тебя пока нет полученных аккаунтов.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    path = export_user_accounts_to_file(tg_id)
+    if path:
+        try:
+            with open(path, "rb") as f:
+                await query.message.reply_document(
+                    document=InputFile(f, filename=f"accounts_{tg_id}.txt"),
+                    caption="📂 Твои аккаунты",
+                )
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    buttons = [
+        [InlineKeyboardButton(item["account"], callback_data=f"account:select:{item['id']}")]
+        for item in accounts[:5]
+    ]
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="main:menu")])
+    await query.edit_message_text(
+        "🎯 Выбери аккаунт:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return MENU
+
+
+async def account_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.edit_message_text(
+            "🤔 Не смог получить твой TG ID.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    try:
+        account_id = int(query.data.split(":", 2)[2])
+    except ValueError:
+        await query.edit_message_text(
+            "😕 Не смог распознать аккаунт.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    account = get_user_account(tg_id, account_id)
+    if not account:
+        await query.edit_message_text(
+            "📭 Аккаунт не найден.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    await query.edit_message_text(
+        f"🎯 Аккаунт выбран:\n<pre>{html.escape(account)}</pre>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🗑 Удалить", callback_data=f"account:delete:{account_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "💳 Сменить оплату",
+                        callback_data=f"account:change:{account_id}",
+                    ),
+                ],
+                [InlineKeyboardButton("🔙 Назад", callback_data="cabinet:accounts")],
+            ]
+        ),
+    )
+    return MENU
+
+
+async def account_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.edit_message_text(
+            "🤔 Не смог получить твой TG ID.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    try:
+        account_id = int(query.data.split(":", 2)[2])
+    except ValueError:
+        await query.edit_message_text(
+            "😕 Не смог распознать аккаунт.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    delete_user_account(tg_id, account_id)
+    await query.edit_message_text(
+        "🗑 Аккаунт удалён.",
+        reply_markup=main_keyboard(update.effective_user),
+    )
+    return MENU
+
+
+async def start_change_with_token(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, token2: str
+):
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await safe_reply(
+            update,
+            context,
+            "🤔 Не смог получить твой TG ID.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    create_active_trip(tg_id, context)
+    context.user_data["device"] = "iphone"
+    context.user_data["token"] = token2
+    context.user_data.pop("session_cookie", None)
+    _update_trip_fields(context, tg_id, {"token2": token2})
+
+    try:
+        parsed = await fetch_trip_details_from_token(token2)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось распарсить данные по token2: %s", e)
+        parsed = {}
+
+    card = parsed.get("card")
+    trip_id = parsed.get("trip_id")
+    context.user_data["card"] = card
+    context.user_data["id"] = trip_id
+    _update_trip_fields(context, tg_id, {"card": card, "trip_id": trip_id})
+
+    if not trip_id:
+        context.user_data["pending_token2_id"] = True
+        await safe_reply(
+            update,
+            context,
+            "🆔 Не нашёл ID профиля. Отправь ID вручную:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_TOKEN2_ID
+
+    orderid, _ = await fetch_order_history_orderid_by_token(token2, trip_id)
+    if not orderid:
+        await safe_reply(
+            update,
+            context,
+            "😕 Не смог автоматически найти order id. Попробуй позже.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    context.user_data["orderid"] = orderid
+    _update_trip_fields(context, tg_id, {"orderid": orderid})
+    return await _show_confirmation(update, context)
+
+
+async def account_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    tg_id = user.id if user else None
+    if tg_id is None:
+        await query.edit_message_text(
+            "🤔 Не смог получить твой TG ID.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    try:
+        account_id = int(query.data.split(":", 2)[2])
+    except ValueError:
+        await query.edit_message_text(
+            "😕 Не смог распознать аккаунт.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    account = get_user_account(tg_id, account_id)
+    if not account:
+        await query.edit_message_text(
+            "📭 Аккаунт не найден.",
+            reply_markup=main_keyboard(update.effective_user),
+        )
+        return MENU
+
+    await query.edit_message_text(
+        f"🎄 Запускаю смену оплаты для аккаунта:\n<pre>{html.escape(account)}</pre>",
+        parse_mode="HTML",
+    )
+    return await start_change_with_token(update, context, account)
 
 
 async def send_mike_orders_list(chat, tg_id: int):
@@ -5466,6 +5810,10 @@ def build_application() -> "Application":
                 CallbackQueryHandler(trip_use_callback, pattern="^tripuse:"),
                 CallbackQueryHandler(info_actions_callback, pattern="^info:"),
                 CallbackQueryHandler(cabinet_export_callback, pattern="^cabinet:export"),
+                CallbackQueryHandler(cabinet_accounts_callback, pattern="^cabinet:accounts"),
+                CallbackQueryHandler(account_select_callback, pattern="^account:select:"),
+                CallbackQueryHandler(account_delete_callback, pattern="^account:delete:"),
+                CallbackQueryHandler(account_change_callback, pattern="^account:change:"),
                 CallbackQueryHandler(
                     cabinet_get_account_callback, pattern="^cabinet:get_account"
                 ),
