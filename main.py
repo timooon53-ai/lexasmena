@@ -3866,6 +3866,12 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "admin":
         return await show_admin_panel(update, context)
 
+    if action == "menu":
+        await query.message.reply_text(
+            "Возвращаюсь в меню ↩️.", reply_markup=main_keyboard()
+        )
+        return MENU
+
     await query.message.reply_text(
         "Не понял выбор 🤔", reply_markup=main_keyboard()
     )
@@ -3965,14 +3971,14 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MENU
 
-    recent_swaps = list_recent_swaps(tg_id, limit=10)
+    recent_swaps = list_recent_swaps(tg_id, limit=5)
     msg_lines = []
     if recent_swaps:
         for item in recent_swaps:
             session_id = str(item.get("session_id") or "—")
             price_value = parse_price_value(item.get("price"))
             начислено = format_balance((price_value or 0.0) * 0.15)
-            msg_lines.append(f"{session_id} {начислено}")
+            msg_lines.append(f"ID сессии: {session_id} • +{начислено}")
     else:
         msg_lines.append("Смен оплат пока нет.")
 
@@ -3993,6 +3999,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Выгрузить все смены оплат", callback_data="cabinet:export"
                     )
                 ],
+                [InlineKeyboardButton("🔙 Назад", callback_data="main:menu")],
             ]
         ),
     )
@@ -5384,9 +5391,8 @@ async def bulk_change_payment(
     await safe_reply(
         update,
         context,
-        f"✅ Оплата успешно изменена\n\n"
-        f"ID сессии: <code>{session_id}</code>\n\n"
-        f"Последний ответ:\n<pre>{last_response}</pre>",
+        f"✅ Оплата успешно изменена\n"
+        f"ID сессии: <code>{session_id}</code>",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
