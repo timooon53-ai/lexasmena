@@ -5887,6 +5887,7 @@ def build_application() -> "Application":
             CommandHandler("request", request_restart),
         ],
         per_message=True,
+        allow_reentry=True,
     )
 
     app.add_handler(conv)
