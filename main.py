@@ -113,7 +113,9 @@ def is_user_allowed(user) -> bool:
     allowed = set(ALLOWED_USER_IDS)
     if ADMIN_TG_ID:
         allowed.add(ADMIN_TG_ID)
-    return user.id in allowed
+    if user.id in allowed or user.id in ADMIN_PANEL_IDS:
+        return True
+    return has_active_access(user.id)
 
 
 async def ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -614,6 +616,17 @@ def init_db():
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS access_grants (
+            tg_id INTEGER PRIMARY KEY,
+            expires_at REAL,
+            granted_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS accounts_first_order (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account TEXT NOT NULL,
@@ -745,6 +758,45 @@ def ensure_user_balance(tg_id: int) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def upsert_access_grant(
+    tg_id: int, *, expires_at: Optional[float], granted_by: Optional[int]
+) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO access_grants (tg_id, expires_at, granted_by)
+        VALUES (?, ?, ?)
+        ON CONFLICT(tg_id) DO UPDATE SET
+            expires_at = excluded.expires_at,
+            granted_by = excluded.granted_by;
+        """,
+        (tg_id, expires_at, granted_by),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_access_grant_expires_at(tg_id: int) -> Optional[float]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT expires_at FROM access_grants WHERE tg_id = ?;", (tg_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return row[0]
+
+
+def has_active_access(tg_id: int) -> bool:
+    expires_at = get_access_grant_expires_at(tg_id)
+    if expires_at is None:
+        return False
+    if expires_at <= 0:
+        return True
+    return time.time() < float(expires_at)
 
 
 def get_user_balance(tg_id: int) -> float:
@@ -3913,60 +3965,22 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MENU
 
-    total_requests = get_request_count_for_user(tg_id)
-    total_swaps = get_swap_history_count(tg_id)
-    balance = get_user_balance(tg_id)
-    recent_swaps = list_recent_swaps(tg_id, limit=5)
-    last_session_id = context.user_data.get("last_session_id")
-    proxy_state = proxy_state_text()
-
-    msg_lines = [
-        "🎄👤 Профиль",
-        "",
-        f"TG ID: <code>{html.escape(str(tg_id))}</code>",
-        f"Всего отправлено запросов: <b>{total_requests}</b>",
-        f"Всего успешных смен оплат: <b>{total_swaps}</b>",
-        f"💰 Баланс: <b>{format_balance(balance)}</b>",
-        f"Прокси: {proxy_state}",
-    ]
-
-    if last_session_id:
-        msg_lines.append(f"Последний ID сессии: <code>{html.escape(str(last_session_id))}</code>")
-
+    recent_swaps = list_recent_swaps(tg_id, limit=10)
+    msg_lines = []
     if recent_swaps:
-        msg_lines.append("")
-        msg_lines.append("Последние 5 смен оплат:")
         for item in recent_swaps:
-            msg_lines.extend(
-                [
-                    f"\nЗапись #{html.escape(str(item.get('id', '—')))}",
-                    f"Время: {html.escape(str(item.get('created_at') or '—'))}",
-                    f"Успешных смен оплат: {html.escape(str(item.get('success_count') or 0))}",
-                    f"Цена: {html.escape(str(item.get('price') or '—'))}",
-                    f"Тариф: {html.escape(str(item.get('tariff') or '—'))}",
-                    f"Ссылка: {html.escape(str(item.get('trip_link') or '—'))}",
-                    f"token2: {html.escape(str(item.get('token2') or '—'))}",
-                    f"session_id: {html.escape(str(item.get('session_id') or '—'))}",
-                    f"orderid: {html.escape(str(item.get('orderid') or '—'))}",
-                    f"card-x: {html.escape(str(item.get('card') or '—'))}",
-                    f"ID: {html.escape(str(item.get('trip_id') or '—'))}",
-                ]
-            )
+            session_id = str(item.get("session_id") or "—")
+            price_value = parse_price_value(item.get("price"))
+            начислено = format_balance((price_value or 0.0) * 0.15)
+            msg_lines.append(f"{session_id} {начислено}")
     else:
-        msg_lines.append("")
         msg_lines.append("Смен оплат пока нет.")
 
     await safe_reply(
         update,
         context,
-        "\n".join(msg_lines),
+        f"<pre>{html.escape(chr(10).join(msg_lines))}</pre>",
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
-    await safe_reply(
-        update,
-        context,
-        "Действия:",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
@@ -4059,6 +4073,38 @@ def admin_reset_confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def admin_access_grant_keyboard(tg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⏱ Час", callback_data=f"admin:access_grant:{tg_id}:hour"
+                ),
+                InlineKeyboardButton(
+                    "🗓 Сутки", callback_data=f"admin:access_grant:{tg_id}:day"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📅 5 дней", callback_data=f"admin:access_grant:{tg_id}:5days"
+                ),
+                InlineKeyboardButton(
+                    "📆 Неделя", callback_data=f"admin:access_grant:{tg_id}:week"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗓 Месяц", callback_data=f"admin:access_grant:{tg_id}:month"
+                ),
+                InlineKeyboardButton(
+                    "♾ Навсегда", callback_data=f"admin:access_grant:{tg_id}:forever"
+                ),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:user:{tg_id}")],
+        ]
+    )
+
+
 def admin_user_actions_keyboard(tg_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -4074,8 +4120,9 @@ def admin_user_actions_keyboard(tg_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "📜 Смены оплат", callback_data=f"admin:swaps:{tg_id}"
                 ),
-                InlineKeyboardButton("⬅️ Назад", callback_data="admin:users"),
+                InlineKeyboardButton("🔑 Доступ", callback_data=f"admin:access:{tg_id}"),
             ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="admin:users")],
             [
                 InlineKeyboardButton("🔄 Обновить", callback_data=f"admin:user:{tg_id}"),
                 InlineKeyboardButton("❌ Закрыть", callback_data="admin:close"),
@@ -4623,6 +4670,66 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         return await admin_export_swaps_callback(
             update, context, target_id=target_id
         )
+    if data.startswith("admin:access:"):
+        try:
+            target_id = int(data.split(":", 2)[2])
+        except ValueError:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать ID пользователя.", reply_markup=main_keyboard()
+            )
+            return MENU
+        await query.answer()
+        await delete_callback_message(query)
+        await query.message.reply_text(
+            f"Выбери срок доступа для пользователя {target_id}:",
+            reply_markup=admin_access_grant_keyboard(target_id),
+        )
+        return MENU
+    if data.startswith("admin:access_grant:"):
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать срок доступа.", reply_markup=main_keyboard()
+            )
+            return MENU
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать ID пользователя.", reply_markup=main_keyboard()
+            )
+            return MENU
+        period = parts[3]
+        now = time.time()
+        durations = {
+            "hour": (60 * 60, "на час"),
+            "day": (24 * 60 * 60, "на сутки"),
+            "5days": (5 * 24 * 60 * 60, "на 5 дней"),
+            "week": (7 * 24 * 60 * 60, "на неделю"),
+            "month": (30 * 24 * 60 * 60, "на месяц"),
+            "forever": (0, "навсегда"),
+        }
+        if period not in durations:
+            await query.answer()
+            await query.message.reply_text(
+                "Не удалось распознать срок доступа.", reply_markup=main_keyboard()
+            )
+            return MENU
+        seconds, label = durations[period]
+        expires_at = 0.0 if seconds == 0 else now + seconds
+        upsert_access_grant(
+            target_id, expires_at=expires_at, granted_by=user.id if user else None
+        )
+        await query.answer()
+        await delete_callback_message(query)
+        await query.message.reply_text(
+            f"Доступ для пользователя {target_id} выдан {label}.",
+            reply_markup=admin_user_actions_keyboard(target_id),
+        )
+        return MENU
 
     await query.answer()
     await query.message.reply_text(
@@ -5266,28 +5373,20 @@ async def bulk_change_payment(
     context.user_data.pop("active_session", None)
     last_response = progress.get("last_response") or "—"
 
-    failed = completed - success
-
-    balance_note = ""
     if success > 0:
-        new_balance, delta = await register_successful_change(
+        await register_successful_change(
             tg_id,
             context,
             session_id=session_id,
             success_count=success,
         )
-        balance_note = f"💰 Баланс +{format_balance(delta)} → {format_balance(new_balance)}"
-
-    balance_block = f"{balance_note}\n" if balance_note else ""
 
     await safe_reply(
         update,
         context,
-        f"✅ Оплата успешно изменена\n"
-        f"Успешных запросов: {success}\n"
-        f"Неуспешных запросов: {failed}\n"
+        f"✅ Оплата успешно изменена\n\n"
         f"ID сессии: <code>{session_id}</code>\n\n"
-        f"{balance_block}Последний ответ:\n<pre>{last_response}</pre>",
+        f"Последний ответ:\n<pre>{last_response}</pre>",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
